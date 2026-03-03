@@ -232,7 +232,7 @@ function initializeSchema(db: Database.Database): void {
     "library_id",
     "library_id TEXT NOT NULL DEFAULT 'cards'"
   );
-  // cards: metadata for SillyInnkeeper (app-specific)
+  // cards: metadata for SillyCharacters (app-specific)
   addColumnIfMissing(
     "cards",
     "innkeeper_meta_json",

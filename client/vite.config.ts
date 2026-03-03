@@ -16,8 +16,10 @@ const appVersion = rootPackageJson.version;
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, repoRoot, "");
-  const innkeeperUrl = String(
-    env.VITE_INNKEEPER_URL ?? "http://127.0.0.1:48912"
+  const sillyCharactersUrl = String(
+    env.VITE_SILLYCHARACTERS_URL ??
+      env.VITE_INNKEEPER_URL ??
+      "http://127.0.0.1:48912"
   ).trim();
 
   return {
@@ -44,7 +46,7 @@ export default defineConfig(({ mode }) => {
       },
       proxy: {
         "/api": {
-          target: innkeeperUrl,
+          target: sillyCharactersUrl,
           changeOrigin: true,
         },
       },

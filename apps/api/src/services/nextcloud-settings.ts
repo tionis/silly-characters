@@ -5,7 +5,8 @@ import {
   normalizeRemoteFolder
 } from "./nextcloud-client";
 
-const SETTINGS_FILE_NAME = ".sillyinnkeeper.json";
+const SETTINGS_FILE_NAME = ".sillycharacters.json";
+const LEGACY_SETTINGS_FILE_NAME = ".sillyinnkeeper.json";
 
 const settingsSchema = z.object({
   version: z.literal(1),
@@ -41,9 +42,12 @@ export type NextcloudSettings = {
   connection: NextcloudSettingsConnection;
 };
 
-function buildSettingsFilePath(remoteFolder: string): string {
+function buildSettingsFilePath(
+  remoteFolder: string,
+  fileName = SETTINGS_FILE_NAME
+): string {
   const folder = normalizeRemoteFolder(remoteFolder);
-  return folder === "/" ? `/${SETTINGS_FILE_NAME}` : `${folder}/${SETTINGS_FILE_NAME}`;
+  return folder === "/" ? `/${fileName}` : `${folder}/${fileName}`;
 }
 
 function toProfile(profile: NextcloudSettingsProfile): NextcloudSettingsProfile {
@@ -69,10 +73,12 @@ export async function readNextcloudSettings(
   client: NextcloudClient,
   remoteFolder: string
 ): Promise<NextcloudSettings | null> {
-  const filePath = buildSettingsFilePath(remoteFolder);
-  const raw = await client.readJsonFile<unknown>(filePath);
+  let raw = await client.readJsonFile<unknown>(buildSettingsFilePath(remoteFolder));
   if (raw === null) {
-    return null;
+    raw = await client.readJsonFile<unknown>(
+      buildSettingsFilePath(remoteFolder, LEGACY_SETTINGS_FILE_NAME)
+    );
+    if (raw === null) return null;
   }
 
   const parsed = settingsSchema.safeParse(raw);

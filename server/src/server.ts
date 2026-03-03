@@ -22,12 +22,22 @@ function readPort(
   return undefined;
 }
 
-// Порт/хост SillyInnkeeper
-// - INNKEEPER_PORT: предпочитаемый вариант
+// Порт/хост SillyCharacters
+// - SILLYCHARACTERS_PORT/SILLYCHARACTERS_HOST: новые переменные
+// - INNKEEPER_PORT/INNKEEPER_HOST: legacy совместимость
 // - PORT: совместимость (например, для хостингов/общих практик)
-const PORT = readPort(process.env.INNKEEPER_PORT, process.env.PORT) ?? 48912;
+const PORT =
+  readPort(
+    process.env.SILLYCHARACTERS_PORT,
+    process.env.INNKEEPER_PORT,
+    process.env.PORT
+  ) ?? 48912;
 const HOST =
-  String(process.env.INNKEEPER_HOST ?? "127.0.0.1").trim() || "127.0.0.1";
+  String(
+    process.env.SILLYCHARACTERS_HOST ??
+      process.env.INNKEEPER_HOST ??
+      "127.0.0.1"
+  ).trim() || "127.0.0.1";
 const ENABLE_BOOT_SCAN =
   String(process.env.ENABLE_BOOT_SCAN ?? "").trim().toLowerCase() === "true";
 

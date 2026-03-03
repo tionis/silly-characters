@@ -189,7 +189,7 @@ export default function App() {
           <Container size="xs" w="100%">
             <Paper withBorder radius="md" p="xl">
               <Stack gap="md">
-                <Title order={3}>SillyInnkeeper</Title>
+                <Title order={3}>SillyCharacters</Title>
                 <Text c="dimmed">
                   Sign in with your Nextcloud account to access your character
                   library.

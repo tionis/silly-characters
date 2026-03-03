@@ -122,7 +122,7 @@ export default function App() {
   return (
     <main className="page">
       <section className="hero">
-        <p className="eyebrow">SillyInnkeeper</p>
+        <p className="eyebrow">SillyCharacters</p>
         <h1>Nextcloud Character Manager</h1>
         <p className="subtitle">
           Web app flow: visit, sign in with Nextcloud OAuth, then manage cards.

@@ -5,7 +5,8 @@ import {
   normalizeRemoteFolder
 } from "./nextcloud-client";
 
-const SETTINGS_FILE_NAME = ".sillyinnkeeper.json";
+const SETTINGS_FILE_NAME = ".sillycharacters.json";
+const LEGACY_SETTINGS_FILE_NAME = ".sillyinnkeeper.json";
 
 const settingsSchema = z.object({
   version: z.literal(1),
@@ -37,17 +38,25 @@ export type NextcloudSettings = {
   };
 };
 
-function buildSettingsFilePath(remoteFolder: string): string {
+function buildSettingsFilePath(
+  remoteFolder: string,
+  fileName = SETTINGS_FILE_NAME
+): string {
   const folder = normalizeRemoteFolder(remoteFolder);
-  return folder === "/" ? `/${SETTINGS_FILE_NAME}` : `${folder}/${SETTINGS_FILE_NAME}`;
+  return folder === "/" ? `/${fileName}` : `${folder}/${fileName}`;
 }
 
 export async function readNextcloudSettings(
   client: NextcloudClient,
   remoteFolder: string
 ): Promise<NextcloudSettings | null> {
-  const raw = await client.readJsonFile<unknown>(buildSettingsFilePath(remoteFolder));
-  if (raw === null) return null;
+  let raw = await client.readJsonFile<unknown>(buildSettingsFilePath(remoteFolder));
+  if (raw === null) {
+    raw = await client.readJsonFile<unknown>(
+      buildSettingsFilePath(remoteFolder, LEGACY_SETTINGS_FILE_NAME)
+    );
+    if (raw === null) return null;
+  }
 
   const parsed = settingsSchema.safeParse(raw);
   if (!parsed.success) {

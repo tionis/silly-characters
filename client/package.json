@@ -2,7 +2,7 @@
   "name": "@characters/client",
   "private": true,
   "version": "0.0.0",
-  "description": "Characters web client (derived from SillyInnkeeper)",
+  "description": "SillyCharacters web client",
   "type": "module",
   "license": "AGPL-3.0",
   "author": "Eric",

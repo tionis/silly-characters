@@ -1,6 +1,6 @@
 const ru = {
   common: {
-    appName: "SillyInnkeeper",
+    appName: "SillyCharacters",
   },
   language: {
     labelBilingual: "Язык (Language)",

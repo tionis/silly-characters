@@ -135,7 +135,7 @@ export function HomePage({
             <Stack gap={2}>
               <Group gap="xs" align="center">
                 <Title order={3} lh={1.1}>
-                  SillyInnkeeper
+                  SillyCharacters
                 </Title>
                 <Badge size="sm" variant="light" c="dimmed">
                   v{__APP_VERSION__}

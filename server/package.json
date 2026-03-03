@@ -1,7 +1,7 @@
 {
   "name": "@characters/server",
   "version": "1.0.0",
-  "description": "Characters API server (derived from SillyInnkeeper)",
+  "description": "SillyCharacters API server",
   "main": "dist/server.js",
   "scripts": {
     "start": "node dist/server.js",
