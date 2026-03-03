@@ -1,5 +1,4 @@
-import { readFile, writeFile, ensureDir } from "fs-extra";
-import { join } from "node:path";
+import type Database from "better-sqlite3";
 import { AppError } from "../errors/app-error";
 
 export type TriState = "any" | "1" | "0";
@@ -41,8 +40,8 @@ export interface CardsFiltersState {
   creator: string[];
   spec_version: string[];
   tags: string[];
-  created_from?: string; // YYYY-MM-DD
-  created_to?: string; // YYYY-MM-DD
+  created_from?: string;
+  created_to?: string;
   prompt_tokens_min: number;
   prompt_tokens_max: number;
   is_sillytavern: TriState;
@@ -58,19 +57,11 @@ export interface CardsFiltersState {
   has_alternate_greetings: TriState;
   alternate_greetings_min: number;
   patterns: TriState;
-
-  // SillyTavern chats filters
   st_chats_count?: number;
   st_chats_count_op?: "eq" | "gte" | "lte";
   st_profile_handle: string[];
   st_hide_no_chats: boolean;
 }
-
-const CARDS_FILTERS_STATE_FILE_PATH = join(
-  process.cwd(),
-  "data",
-  "cards-filters-state.json"
-);
 
 const DEFAULT_STATE: CardsFiltersState = {
   sort: "created_at_desc",
@@ -146,6 +137,11 @@ const FTS_FIELD_VALUES: CardsFtsField[] = [
   "group_only_greetings",
 ];
 
+function normalizeUserId(userId?: string | null): string | null {
+  const normalized = typeof userId === "string" ? userId.trim() : "";
+  return normalized.length > 0 ? normalized : null;
+}
+
 function normalizeTriState(v: unknown, fallback: TriState = "any"): TriState {
   return v === "any" || v === "1" || v === "0" ? v : fallback;
 }
@@ -173,19 +169,13 @@ function normalizeOptionalNonNegativeInt(v: unknown): number | undefined {
   return Math.floor(n);
 }
 
-function normalizeOptionalString(v: unknown): string | undefined {
-  if (typeof v !== "string") return undefined;
-  const s = v.trim();
-  return s.length > 0 ? s : undefined;
-}
-
 function normalizeChatsCountOp(
   v: unknown
 ): "eq" | "gte" | "lte" | undefined {
   return v === "eq" || v === "gte" || v === "lte" ? v : undefined;
 }
 
-function normalizeBoolean(v: unknown, fallback: boolean = false): boolean {
+function normalizeBoolean(v: unknown, fallback = false): boolean {
   if (typeof v === "boolean") return v;
   if (v === 1 || v === "1" || v === "true") return true;
   if (v === 0 || v === "0" || v === "false") return false;
@@ -308,7 +298,6 @@ function normalizeState(raw: unknown): CardsFiltersState {
       DEFAULT_STATE.alternate_greetings_min
     ),
     patterns: normalizeTriState(src.patterns, DEFAULT_STATE.patterns),
-
     st_chats_count: normalizeOptionalNonNegativeInt(src.st_chats_count),
     st_chats_count_op: normalizeChatsCountOp(src.st_chats_count_op),
     st_profile_handle: normalizeStringArrayOrSingle(src.st_profile_handle),
@@ -319,28 +308,62 @@ function normalizeState(raw: unknown): CardsFiltersState {
   };
 }
 
-export async function getCardsFiltersState(): Promise<CardsFiltersState> {
-  try {
-    const data = await readFile(CARDS_FILTERS_STATE_FILE_PATH, "utf-8");
-    const parsed = JSON.parse(data) as unknown;
-    return normalizeState(parsed);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      await ensureDir(join(process.cwd(), "data"));
-      await writeFile(
-        CARDS_FILTERS_STATE_FILE_PATH,
-        JSON.stringify(DEFAULT_STATE, null, 2),
-        "utf-8"
-      );
-      return DEFAULT_STATE;
-    }
-    // Corrupted JSON or other error: fall back to defaults
+type FiltersStateRow = { state_json: string };
+
+function upsertFiltersStateRow(
+  db: Database.Database,
+  userId: string,
+  state: CardsFiltersState
+): void {
+  const now = Date.now();
+  db.prepare(
+    `
+      INSERT INTO user_cards_filters_state (user_id, state_json, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        state_json = excluded.state_json,
+        updated_at = excluded.updated_at
+    `
+  ).run(userId, JSON.stringify(state), now);
+}
+
+export async function getCardsFiltersState(
+  db: Database.Database,
+  userId?: string | null
+): Promise<CardsFiltersState> {
+  const normalizedUserId = normalizeUserId(userId);
+  if (!normalizedUserId) {
     return DEFAULT_STATE;
   }
+
+  const row = db
+    .prepare(
+      `
+        SELECT state_json
+        FROM user_cards_filters_state
+        WHERE user_id = ?
+        LIMIT 1
+      `
+    )
+    .get(normalizedUserId) as FiltersStateRow | undefined;
+
+  if (row?.state_json) {
+    try {
+      return normalizeState(JSON.parse(row.state_json) as unknown);
+    } catch {
+      return DEFAULT_STATE;
+    }
+  }
+
+  const initial = DEFAULT_STATE;
+  upsertFiltersStateRow(db, normalizedUserId, initial);
+  return initial;
 }
 
 export async function updateCardsFiltersState(
-  newState: unknown
+  db: Database.Database,
+  newState: unknown,
+  userId?: string | null
 ): Promise<CardsFiltersState> {
   if (typeof newState !== "object" || newState === null) {
     throw new AppError({
@@ -350,13 +373,11 @@ export async function updateCardsFiltersState(
   }
 
   const normalized = normalizeState({ ...DEFAULT_STATE, ...(newState as any) });
+  const normalizedUserId = normalizeUserId(userId);
+  if (!normalizedUserId) {
+    return normalized;
+  }
 
-  await ensureDir(join(process.cwd(), "data"));
-  await writeFile(
-    CARDS_FILTERS_STATE_FILE_PATH,
-    JSON.stringify(normalized, null, 2),
-    "utf-8"
-  );
-
+  upsertFiltersStateRow(db, normalizedUserId, normalized);
   return normalized;
 }

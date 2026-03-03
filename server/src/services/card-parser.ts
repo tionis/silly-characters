@@ -1,4 +1,4 @@
-import { parsePngMetadata } from "./png-parser";
+import { parsePngMetadata, parsePngMetadataBuffer } from "./png-parser";
 import { CardValidator } from "./card-validator";
 import { CardDataExtractor } from "./card-data-extractor";
 import { ExtractedCardData } from "./types";
@@ -34,6 +34,24 @@ export class CardParser {
       return this.parseJson(parsedData.data, filePath);
     } catch (error) {
       logger.errorKey(error, "error.cardParser.parsePngFailed", { filePath });
+      return null;
+    }
+  }
+
+  parseBuffer(buffer: Buffer, sourceLabel = "[buffer]"): ExtractedCardData | null {
+    try {
+      const parsedData = parsePngMetadataBuffer(buffer, sourceLabel);
+      if (!parsedData) {
+        logger.errorMessageKey("error.cardParser.noMetadata", {
+          filePath: sourceLabel,
+        });
+        return null;
+      }
+      return this.parseJson(parsedData.data, sourceLabel);
+    } catch (error) {
+      logger.errorKey(error, "error.cardParser.parsePngFailed", {
+        filePath: sourceLabel,
+      });
       return null;
     }
   }

@@ -1,6 +1,5 @@
+import type Database from "better-sqlite3";
 import { accessSync, constants } from "node:fs";
-import { readFile, writeFile, ensureDir } from "fs-extra";
-import { dirname, join } from "node:path";
 import { AppError } from "../errors/app-error";
 
 export type Language = "ru" | "en";
@@ -11,19 +10,86 @@ export interface Settings {
   language: Language;
 }
 
-function settingsFilePathForUser(userId?: string | null): string {
-  const normalized = typeof userId === "string" ? userId.trim() : "";
-  if (!normalized) {
-    return join(process.cwd(), "data", "settings.global.json");
-  }
-  return join(process.cwd(), "data", "users", normalized, "settings.json");
-}
-
 const DEFAULT_SETTINGS: Settings = {
   cardsFolderPath: null,
   sillytavenrPath: null,
   language: "en",
 };
+
+function normalizeUserId(userId?: string | null): string | null {
+  const normalized = typeof userId === "string" ? userId.trim() : "";
+  return normalized.length > 0 ? normalized : null;
+}
+
+function parseSettings(raw: unknown): Settings {
+  const source = (typeof raw === "object" && raw !== null ? raw : {}) as Partial<Settings>;
+  const merged: Settings = {
+    ...DEFAULT_SETTINGS,
+    ...source,
+  };
+
+  try {
+    validateLanguage(merged.language);
+  } catch {
+    merged.language = DEFAULT_SETTINGS.language;
+  }
+
+  merged.cardsFolderPath =
+    typeof merged.cardsFolderPath === "string" && merged.cardsFolderPath.trim()
+      ? merged.cardsFolderPath.trim()
+      : null;
+  merged.sillytavenrPath =
+    typeof merged.sillytavenrPath === "string" && merged.sillytavenrPath.trim()
+      ? merged.sillytavenrPath.trim()
+      : null;
+
+  return merged;
+}
+
+type SettingsRow = {
+  cards_folder_path: string | null;
+  sillytavenr_path: string | null;
+  language: string;
+};
+
+function rowToSettings(row: SettingsRow): Settings {
+  return parseSettings({
+    cardsFolderPath: row.cards_folder_path,
+    sillytavenrPath: row.sillytavenr_path,
+    language: row.language,
+  });
+}
+
+function upsertSettingsRow(
+  db: Database.Database,
+  userId: string,
+  settings: Settings
+): void {
+  const now = Date.now();
+  db.prepare(
+    `
+      INSERT INTO user_settings (
+        user_id,
+        cards_folder_path,
+        sillytavenr_path,
+        language,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        cards_folder_path = excluded.cards_folder_path,
+        sillytavenr_path = excluded.sillytavenr_path,
+        language = excluded.language,
+        updated_at = excluded.updated_at
+    `
+  ).run(
+    userId,
+    settings.cardsFolderPath,
+    settings.sillytavenrPath,
+    settings.language,
+    now
+  );
+}
 
 /**
  * Проверяет существование пути через fs.accessSync
@@ -55,66 +121,58 @@ export function validateLanguage(
   }
 }
 
-/**
- * Читает настройки из файла. Если файл не существует, создает его с дефолтными значениями.
- * @returns Текущие настройки
- */
-export async function getSettings(): Promise<Settings> {
-  return getSettingsForUser();
+export async function getSettings(db?: Database.Database): Promise<Settings> {
+  return getSettingsForUser(null, db);
 }
 
-export async function getSettingsForUser(userId?: string | null): Promise<Settings> {
-  const settingsFilePath = settingsFilePathForUser(userId);
-  try {
-    const data = await readFile(settingsFilePath, "utf-8");
-    const parsed = JSON.parse(data) as Partial<Settings>;
-    const merged: Settings = { ...DEFAULT_SETTINGS, ...parsed };
+export async function getSettingsForUser(
+  userId?: string | null,
+  db?: Database.Database
+): Promise<Settings> {
+  const normalizedUserId = normalizeUserId(userId);
 
-    // If language value in file is invalid, fall back to default.
-    try {
-      validateLanguage(merged.language);
-      return merged;
-    } catch {
-      return { ...merged, language: DEFAULT_SETTINGS.language };
-    }
-  } catch (error) {
-    // Если файл не существует, создаем его с дефолтными значениями
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      await ensureDir(dirname(settingsFilePath));
-      await writeFile(
-        settingsFilePath,
-        JSON.stringify(DEFAULT_SETTINGS, null, 2),
-        "utf-8"
-      );
-      return DEFAULT_SETTINGS;
-    }
-    throw error;
+  if (!normalizedUserId) {
+    return DEFAULT_SETTINGS;
   }
+
+  if (!db) {
+    throw new Error("Database is required for user-scoped settings");
+  }
+
+  const row = db
+    .prepare(
+      `
+        SELECT cards_folder_path, sillytavenr_path, language
+        FROM user_settings
+        WHERE user_id = ?
+        LIMIT 1
+      `
+    )
+    .get(normalizedUserId) as SettingsRow | undefined;
+
+  if (row) return rowToSettings(row);
+
+  const initial = DEFAULT_SETTINGS;
+  upsertSettingsRow(db, normalizedUserId, initial);
+  return initial;
 }
 
-/**
- * Обновляет настройки с валидацией путей
- * @param newSettings Новые настройки
- * @throws Error если какой-то из путей не существует
- */
-export async function updateSettings(newSettings: Settings): Promise<Settings> {
-  return updateSettingsForUser(newSettings);
+export async function updateSettings(
+  newSettings: Settings,
+  db?: Database.Database
+): Promise<Settings> {
+  return updateSettingsForUser(newSettings, null, undefined, db);
 }
 
 export async function updateSettingsForUser(
   newSettings: Settings,
   userId?: string | null,
-  options?: { skipPathValidation?: boolean }
+  options?: { skipPathValidation?: boolean },
+  db?: Database.Database
 ): Promise<Settings> {
-  const settingsFilePath = settingsFilePathForUser(userId);
-  const normalized: Settings = {
-    ...DEFAULT_SETTINGS,
-    ...(newSettings as Partial<Settings>),
-  };
-
+  const normalized: Settings = parseSettings(newSettings as Partial<Settings>);
   validateLanguage(normalized.language);
 
-  // Валидация путей: если путь указан (не null), проверяем его существование
   if (!options?.skipPathValidation && normalized.cardsFolderPath !== null) {
     validatePath(normalized.cardsFolderPath);
   }
@@ -123,15 +181,15 @@ export async function updateSettingsForUser(
     validatePath(normalized.sillytavenrPath);
   }
 
-  // Убеждаемся, что папка data существует
-  await ensureDir(dirname(settingsFilePath));
+  const normalizedUserId = normalizeUserId(userId);
+  if (!normalizedUserId) {
+    return normalized;
+  }
 
-  // Сохраняем настройки
-  await writeFile(
-    settingsFilePath,
-    JSON.stringify(normalized, null, 2),
-    "utf-8"
-  );
+  if (!db) {
+    throw new Error("Database is required for user-scoped settings");
+  }
 
+  upsertSettingsRow(db, normalizedUserId, normalized);
   return normalized;
 }

@@ -1,5 +1,4 @@
-import { ensureDir, readFile, writeFile } from "fs-extra";
-import { join } from "node:path";
+import type Database from "better-sqlite3";
 import { AppError } from "../errors/app-error";
 
 export type PatternRuleType = "regex";
@@ -11,7 +10,7 @@ export interface PatternRule {
   pattern: string;
   enabled: boolean;
   flags: string;
-  caseSensitive?: boolean; // legacy/compat (optional)
+  caseSensitive?: boolean;
 }
 
 export interface PatternRulesFile {
@@ -20,30 +19,26 @@ export interface PatternRulesFile {
   updatedAt: number;
 }
 
-const PATTERN_RULES_FILE_PATH = join(
-  process.cwd(),
-  "data",
-  "pattern-rules.json"
-);
-
 const DEFAULT_PATTERN_RULES: PatternRulesFile = {
   version: 1,
   rules: [],
   updatedAt: 0,
 };
 
+function normalizeUserId(userId?: string | null): string | null {
+  const normalized = typeof userId === "string" ? userId.trim() : "";
+  return normalized.length > 0 ? normalized : null;
+}
+
 function normalizeFlags(
   raw: string,
   opts?: { caseSensitive?: boolean }
 ): string {
   const trimmed = raw.trim();
-
-  // Backward compat: if caseSensitive === false and "i" not present, add it.
   const wantInsensitive = opts?.caseSensitive === false;
   const hasI = trimmed.includes("i");
   const base = wantInsensitive && !hasI ? `${trimmed}i` : trimmed;
 
-  // Remove duplicates, keep order.
   const seen = new Set<string>();
   let out = "";
   for (const ch of base) {
@@ -87,8 +82,6 @@ function validateRule(rule: PatternRule): void {
   const flagsRaw = typeof rule.flags === "string" ? rule.flags : "";
   const flags = normalizeFlags(flagsRaw, { caseSensitive: rule.caseSensitive });
 
-  // Node.js supported flags: d g i m s u v y (v: set notation, newer)
-  // We allow a safe subset plus v when available.
   if (!/^[dgimsuvy]*$/.test(flags)) {
     throw new AppError({
       status: 400,
@@ -96,8 +89,6 @@ function validateRule(rule: PatternRule): void {
     });
   }
 
-  // Validate compilation (ReDoS risk is accepted in v1).
-  // NOTE: If "v" is not supported by the runtime, compilation will throw and we'll surface 400.
   // eslint-disable-next-line no-new
   new RegExp(pattern, flags);
 }
@@ -130,38 +121,67 @@ export function validatePatternRulesFile(
   }
 }
 
-export async function getPatternRules(): Promise<PatternRulesFile> {
-  try {
-    const json = await readFile(PATTERN_RULES_FILE_PATH, "utf-8");
-    const parsed = JSON.parse(json) as unknown;
-    // If invalid, fall back to default (do not crash startup).
+type PatternRulesRow = { rules_json: string };
+
+function upsertPatternRulesRow(
+  db: Database.Database,
+  userId: string,
+  value: PatternRulesFile
+): void {
+  const now = Date.now();
+  db.prepare(
+    `
+      INSERT INTO user_pattern_rules (user_id, rules_json, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        rules_json = excluded.rules_json,
+        updated_at = excluded.updated_at
+    `
+  ).run(userId, JSON.stringify(value), now);
+}
+
+export async function getPatternRules(
+  db: Database.Database,
+  userId?: string | null
+): Promise<PatternRulesFile> {
+  const normalizedUserId = normalizeUserId(userId);
+  if (!normalizedUserId) {
+    return DEFAULT_PATTERN_RULES;
+  }
+
+  const row = db
+    .prepare(
+      `
+        SELECT rules_json
+        FROM user_pattern_rules
+        WHERE user_id = ?
+        LIMIT 1
+      `
+    )
+    .get(normalizedUserId) as PatternRulesRow | undefined;
+
+  if (row?.rules_json) {
     try {
+      const parsed = JSON.parse(row.rules_json) as unknown;
       validatePatternRulesFile(parsed);
       return parsed as PatternRulesFile;
     } catch {
       return DEFAULT_PATTERN_RULES;
     }
-  } catch (e) {
-    const err = e as NodeJS.ErrnoException | null;
-    if (err?.code === "ENOENT") {
-      await ensureDir(join(process.cwd(), "data"));
-      await writeFile(
-        PATTERN_RULES_FILE_PATH,
-        JSON.stringify(DEFAULT_PATTERN_RULES, null, 2),
-        "utf-8"
-      );
-      return DEFAULT_PATTERN_RULES;
-    }
-    throw e;
   }
+
+  const initial = DEFAULT_PATTERN_RULES;
+  upsertPatternRulesRow(db, normalizedUserId, initial);
+  return initial;
 }
 
 export async function updatePatternRules(
+  db: Database.Database,
+  userId: string | null,
   raw: unknown
 ): Promise<PatternRulesFile> {
-  // Accept either:
-  // - an array of rules
-  // - an object { rules: [...] }
+  const normalizedUserId = normalizeUserId(userId);
+
   const obj = raw as { rules?: unknown } | null;
   const rules = Array.isArray(raw)
     ? raw
@@ -188,7 +208,6 @@ export async function updatePatternRules(
       flags,
     };
 
-    // Preserve legacy field if present (optional)
     if (typeof (r as any)?.caseSensitive === "boolean") {
       out.caseSensitive = (r as any).caseSensitive;
     }
@@ -203,11 +222,10 @@ export async function updatePatternRules(
     updatedAt: Date.now(),
   };
 
-  await ensureDir(join(process.cwd(), "data"));
-  await writeFile(
-    PATTERN_RULES_FILE_PATH,
-    JSON.stringify(next, null, 2),
-    "utf-8"
-  );
+  if (!normalizedUserId) {
+    return next;
+  }
+
+  upsertPatternRulesRow(db, normalizedUserId, next);
   return next;
 }

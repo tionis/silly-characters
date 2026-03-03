@@ -24,18 +24,18 @@ import {
   readNextcloudSettings,
   writeNextcloudSettings
 } from "../../services/nextcloud-settings";
+import { syncUserNextcloudIndex } from "../../services/nextcloud-index";
 import {
-  getUserCardsMirrorPath,
-  syncNextcloudPngsToLocalMirror
-} from "../../services/nextcloud-sync";
-import { getOrCreateLibraryId } from "../../services/libraries";
-import type { CardsSyncOrchestrator } from "../../services/cards-sync-orchestrator";
+  getNextcloudLibraryFolderKey,
+  getOrCreateNextcloudLibraryId,
+} from "../../services/nextcloud-storage";
 import {
   getSettingsForUser,
-  updateSettingsForUser
+  updateSettingsForUser,
 } from "../../services/settings";
 import { logger } from "../../utils/logger";
 import { SESSION_COOKIE } from "../../middleware/auth-session";
+import type { SseHub } from "../../services/sse-hub";
 
 const router = Router();
 
@@ -43,13 +43,9 @@ function getDb(req: Request): Database.Database {
   return req.app.locals.db as Database.Database;
 }
 
-function getOrchestrator(req: Request): CardsSyncOrchestrator {
-  const orchestrator = (req.app.locals as any)
-    .cardsSyncOrchestrator as CardsSyncOrchestrator | undefined;
-  if (!orchestrator) {
-    throw new Error("CardsSyncOrchestrator is not initialized");
-  }
-  return orchestrator;
+function getHub(req: Request): SseHub | null {
+  const hub = (req.app.locals as any).sseHub as SseHub | undefined;
+  return hub ?? null;
 }
 
 function webOrigin(): string {
@@ -87,44 +83,55 @@ function resolveReturnTo(req: Request): string | null {
   return null;
 }
 
-async function syncUserMirrorAndScan(req: Request, userId: string): Promise<void> {
+async function syncUserLibraryIndex(req: Request, userId: string): Promise<void> {
   const db = getDb(req);
-  const creds = await getNextcloudCredentials(db, userId);
-  if (!creds) {
-    throw new Error("Nextcloud credentials unavailable");
-  }
+  const startedAt = Date.now();
+  const syncResult = await syncUserNextcloudIndex({ db, userId });
+  const finishedAt = Date.now();
 
-  const client = new NextcloudClient(
-    creds.baseUrl,
-    creds.username,
-    creds.accessToken
-  );
-  const syncResult = await syncNextcloudPngsToLocalMirror({
-    userId,
-    client,
-    remoteFolder: creds.remoteFolder
-  });
+  const status = getNextcloudConnectionStatus(db, userId);
+  const folderPath = status.remoteFolder ?? "/characters";
+  const libraryFolderKey = getNextcloudLibraryFolderKey(userId, folderPath);
+  const libraryId = getOrCreateNextcloudLibraryId(db, userId, folderPath);
 
-  updateNextcloudLastSync(db, userId, Date.now());
-
-  const localCardsPath = getUserCardsMirrorPath(userId);
-  const currentSettings = await getSettingsForUser(userId);
+  const currentSettings = await getSettingsForUser(userId, db);
   await updateSettingsForUser(
     {
       ...currentSettings,
-      cardsFolderPath: localCardsPath,
-      sillytavenrPath: null
+      cardsFolderPath: libraryFolderKey,
+      sillytavenrPath: null,
     },
     userId,
-    { skipPathValidation: true }
+    { skipPathValidation: true },
+    db
   );
 
-  const libraryId = getOrCreateLibraryId(db, localCardsPath);
-  getOrchestrator(req).requestScan("app", localCardsPath, libraryId);
+  const locals = req.app.locals as any;
+  const revision = Number.isFinite(locals.nextcloudRevision)
+    ? Number(locals.nextcloudRevision) + 1
+    : 1;
+  locals.nextcloudRevision = revision;
 
-  logger.info("Nextcloud mirror synced for user", {
+  getHub(req)?.broadcast(
+    "cards:resynced",
+    {
+      revision,
+      origin: "app",
+      libraryId,
+      folderPath,
+      addedCards: syncResult.indexed,
+      removedCards: syncResult.removed,
+      startedAt,
+      finishedAt,
+      durationMs: finishedAt - startedAt
+    },
+    { id: `${revision}:resynced` }
+  );
+
+  logger.info("Nextcloud index synced for user", {
     userId,
-    downloaded: syncResult.downloaded,
+    indexed: syncResult.indexed,
+    skipped: syncResult.skipped,
     removed: syncResult.removed,
     totalRemotePng: syncResult.totalRemotePng
   });
@@ -303,7 +310,7 @@ router.get("/auth/callback", async (req: Request, res: Response) => {
     }
 
     req.currentUser = resolvedUser;
-    await syncUserMirrorAndScan(req, userId);
+    await syncUserLibraryIndex(req, userId);
 
     res.redirect(`${callbackOrigin}/?auth=success`);
   } catch (error) {
@@ -337,7 +344,7 @@ router.post("/auth/sync", async (req: Request, res: Response) => {
   }
 
   try {
-    await syncUserMirrorAndScan(req, user.id);
+    await syncUserLibraryIndex(req, user.id);
     res.json({ ok: true });
   } catch (error) {
     res.status(500).json({

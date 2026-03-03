@@ -20,17 +20,27 @@ function getHub(req: Request): SseHub {
   return hub;
 }
 
-type PatternRunState = { running: boolean };
+type PatternRunState = { runningUsers: Set<string> };
 
 function getState(req: Request): PatternRunState {
   const locals = req.app.locals as any;
-  if (!locals.patternRulesState) locals.patternRulesState = { running: false };
+  if (!locals.patternRulesState) {
+    locals.patternRulesState = { runningUsers: new Set<string>() };
+  }
   return locals.patternRulesState as PatternRunState;
 }
 
-router.get("/pattern-rules", async (_req: Request, res: Response) => {
+function getUserId(req: Request): string | null {
+  const value = req.currentUser?.id;
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
+router.get("/pattern-rules", async (req: Request, res: Response) => {
   try {
-    const file = await getPatternRules();
+    const db = getDb(req);
+    const file = await getPatternRules(db, getUserId(req));
     res.json(file);
   } catch (error) {
     logger.errorKey(error, "api.pattern_rules.get_failed");
@@ -43,9 +53,10 @@ router.get("/pattern-rules", async (_req: Request, res: Response) => {
 
 router.put("/pattern-rules", async (req: Request, res: Response) => {
   try {
+    const db = getDb(req);
     const body = req.body as any;
     const rulesInput = Array.isArray(body) ? body : body?.rules;
-    const next = await updatePatternRules(rulesInput);
+    const next = await updatePatternRules(db, getUserId(req), rulesInput);
     res.json(next);
   } catch (error) {
     logger.errorKey(error, "api.pattern_rules.update_failed");
@@ -59,7 +70,13 @@ router.put("/pattern-rules", async (req: Request, res: Response) => {
 router.get("/pattern-rules/status", async (req: Request, res: Response) => {
   try {
     const db = getDb(req);
-    const file = await getPatternRules();
+    const userId = getUserId(req);
+    if (!userId) {
+      res.status(401).json({ ok: false, error: "unauthorized" });
+      return;
+    }
+
+    const file = await getPatternRules(db, userId);
     const hasRules = file.rules.length > 0;
     const hasEnabledRules = file.rules.some((r) => r.enabled);
 
@@ -67,12 +84,13 @@ router.get("/pattern-rules/status", async (req: Request, res: Response) => {
       .prepare(
         `
         SELECT rules_hash, created_at, status, error
-        FROM pattern_rules_cache
+        FROM user_pattern_rules_cache
+        WHERE user_id = ?
         ORDER BY created_at DESC
         LIMIT 20
       `
       )
-      .all() as Array<{
+      .all(userId) as Array<{
       rules_hash: string;
       created_at: number;
       status: "building" | "ready" | "failed";
@@ -111,8 +129,14 @@ router.get("/pattern-rules/status", async (req: Request, res: Response) => {
 });
 
 router.post("/pattern-rules/run", async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+
   const state = getState(req);
-  if (state.running) {
+  if (state.runningUsers.has(userId)) {
     return sendError(
       res,
       new AppError({ status: 409, code: "api.pattern_rules.already_running" })
@@ -124,25 +148,24 @@ router.post("/pattern-rules/run", async (req: Request, res: Response) => {
     const hub = getHub(req);
     const runId = randomUUID();
 
-    state.running = true;
+    state.runningUsers.add(userId);
     const { rules_hash, job } = await startPatternRulesRun({
       db,
       hub,
       runId,
-      userId: req.currentUser?.id ?? null,
+      userId,
     });
     void job
       .catch((error) => {
-        // Do not crash the process on unhandled rejection; errors are already reported via SSE.
         logger.errorKey(error, "api.pattern_rules.run_failed");
       })
       .finally(() => {
-        state.running = false;
+        state.runningUsers.delete(userId);
       });
 
     res.status(202).json({ run_id: runId, rules_hash });
   } catch (error) {
-    state.running = false;
+    state.runningUsers.delete(userId);
     logger.errorKey(error, "api.pattern_rules.run_failed");
     return sendError(res, error, {
       status: 500,
@@ -152,4 +175,3 @@ router.post("/pattern-rules/run", async (req: Request, res: Response) => {
 });
 
 export default router;
-

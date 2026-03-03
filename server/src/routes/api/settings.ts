@@ -1,4 +1,5 @@
 import { Router, Request, Response } from "express";
+import type Database from "better-sqlite3";
 import {
   getSettingsForUser,
   updateSettingsForUser,
@@ -12,11 +13,16 @@ import { sendError } from "../../errors/http";
 
 const router = Router();
 
+function getDb(req: Request): Database.Database {
+  return req.app.locals.db as Database.Database;
+}
+
 // GET /api/settings - получение текущих настроек
 router.get("/settings", async (req: Request, res: Response) => {
   try {
+    const db = getDb(req);
     const userId = req.currentUser?.id ?? null;
-    const settings = await getSettingsForUser(userId);
+    const settings = await getSettingsForUser(userId, db);
     res.json(settings);
   } catch (error) {
     logger.errorKey(error, "api.settings.get_failed");
@@ -30,6 +36,7 @@ router.get("/settings", async (req: Request, res: Response) => {
 // PUT /api/settings - обновление настроек (полное обновление)
 router.put("/settings", async (req: Request, res: Response) => {
   try {
+    const db = getDb(req);
     const userId = req.currentUser?.id ?? null;
     if (!userId) {
       throw new AppError({
@@ -46,7 +53,7 @@ router.put("/settings", async (req: Request, res: Response) => {
       });
     }
 
-    const prevSettings = await getSettingsForUser(userId);
+    const prevSettings = await getSettingsForUser(userId, db);
     const nextLanguage =
       payload.language != null ? payload.language : prevSettings.language;
     validateLanguage(nextLanguage);
@@ -61,7 +68,8 @@ router.put("/settings", async (req: Request, res: Response) => {
     const savedSettings = await updateSettingsForUser(
       nextSettings,
       userId,
-      { skipPathValidation: true }
+      { skipPathValidation: true },
+      db
     );
     // Обновляем язык в рантайме, чтобы логи/ошибки переключались сразу
     setCurrentLanguage(savedSettings.language);

@@ -1,10 +1,9 @@
 import { Router, Request, Response } from "express";
 import Database from "better-sqlite3";
 import { existsSync, statSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { remove, rename, unlink } from "fs-extra";
-import { dirname, join } from "node:path";
+import { remove } from "fs-extra";
+import { dirname, posix as pathPosix } from "node:path";
 import { createCardsService } from "../../services/cards";
 import { resolveCardChatsFolderPath } from "../../services/card-chats";
 import { logger } from "../../utils/logger";
@@ -15,10 +14,6 @@ import type {
   TriState,
 } from "../../services/cards";
 import { createCardsFiltersService } from "../../services/cards-filters";
-import { getSettingsForUser } from "../../services/settings";
-import { getOrCreateLibraryId } from "../../services/libraries";
-import { createScanService } from "../../services/scan";
-import { createTagService } from "../../services/tags";
 import { computeContentHash } from "../../services/card-hash";
 import { AppError } from "../../errors/app-error";
 import { sendError } from "../../errors/http";
@@ -29,11 +24,17 @@ import {
   makeAttachmentContentDisposition,
   sanitizeWindowsFilenameBase,
 } from "../../utils/filename";
-import { syncLocalMirrorChangesToNextcloud } from "../../services/nextcloud-mirror-write";
 import {
   ensureCardInLibraries,
   resolveUserLibraryIds,
 } from "../../services/user-libraries";
+import {
+  fromNextcloudVirtualPath,
+  getNextcloudUserContext,
+  pickUniqueRemotePngPath,
+  toNextcloudVirtualPath,
+} from "../../services/nextcloud-storage";
+import { syncUserNextcloudIndex } from "../../services/nextcloud-index";
 
 const router = Router();
 
@@ -46,6 +47,23 @@ function getHub(req: Request): SseHub {
   const hub = (req.app.locals as any).sseHub as SseHub | undefined;
   if (!hub) throw new Error("SSE hub is not initialized");
   return hub;
+}
+
+function getCurrentUserId(req: Request): string {
+  const userId =
+    typeof req.currentUser?.id === "string" ? req.currentUser.id.trim() : "";
+  if (!userId) {
+    throw new AppError({ status: 401, code: "api.auth.unauthorized" });
+  }
+  return userId;
+}
+
+function resolveRemotePathOrThrow(userId: string, filePath: string): string {
+  const remotePath = fromNextcloudVirtualPath(userId, filePath);
+  if (!remotePath) {
+    throw new AppError({ status: 404, code: "api.image.not_found" });
+  }
+  return remotePath;
 }
 
 function safeJsonParse<T = unknown>(value: unknown): T | null {
@@ -314,6 +332,7 @@ router.get("/cards", async (req: Request, res: Response) => {
 
     const params: SearchCardsParams = {
       library_ids: libraryIds,
+      user_id: req.currentUser?.id ?? null,
       sort,
       name,
       q,
@@ -394,8 +413,8 @@ router.get("/cards/:id/export.png", async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const db = getDb(req);
-    const currentUserId = req.currentUser?.id ?? null;
-    const libraryIds = await resolveUserLibraryIds(db, req.currentUser?.id ?? null);
+    const userId = getCurrentUserId(req);
+    const libraryIds = await resolveUserLibraryIds(db, userId);
     ensureCardInLibraries(db, id, libraryIds);
 
     const row = db
@@ -435,16 +454,15 @@ router.get("/cards/:id/export.png", async (req: Request, res: Response) => {
     if (!mainFilePath) {
       throw new AppError({ status: 404, code: "api.image.not_found" });
     }
-    if (!existsSync(mainFilePath)) {
-      throw new AppError({ status: 404, code: "api.image.file_not_found" });
-    }
+    const remotePath = resolveRemotePathOrThrow(userId, mainFilePath);
 
     const ccv3Object = safeJsonParse<unknown>(row.data_json);
     if (!ccv3Object) {
       throw new AppError({ status: 500, code: "api.export.invalid_data_json" });
     }
 
-    const originalPng = await readFile(mainFilePath);
+    const ctx = await getNextcloudUserContext(db, userId);
+    const originalPng = await ctx.client.downloadFile(remotePath);
     const outPng = buildPngWithCcv3TextChunk({
       inputPng: originalPng,
       ccv3Object,
@@ -506,8 +524,8 @@ router.get("/cards/:id", async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const db = getDb(req);
-    const currentUserId = req.currentUser?.id ?? null;
-    const libraryIds = await resolveUserLibraryIds(db, req.currentUser?.id ?? null);
+    const userId = getCurrentUserId(req);
+    const libraryIds = await resolveUserLibraryIds(db, userId);
     ensureCardInLibraries(db, id, libraryIds);
 
     const row = db
@@ -802,8 +820,8 @@ router.post("/cards/:id/save", async (req: Request, res: Response) => {
     }
 
     const db = getDb(req);
-    const currentUserId = req.currentUser?.id ?? null;
-    const libraryIds = await resolveUserLibraryIds(db, req.currentUser?.id ?? null);
+    const userId = getCurrentUserId(req);
+    const libraryIds = await resolveUserLibraryIds(db, userId);
     ensureCardInLibraries(db, id, libraryIds);
 
     const cardRow = db
@@ -859,9 +877,6 @@ router.post("/cards/:id/save", async (req: Request, res: Response) => {
     if (!main_file_path) {
       throw new AppError({ status: 404, code: "api.image.not_found" });
     }
-    if (!existsSync(main_file_path)) {
-      throw new AppError({ status: 404, code: "api.image.file_not_found" });
-    }
 
     // --- No-changes short-circuit (compare by the same hash as dedup) ---
     const currentParsed = safeJsonParse<unknown>(cardRow.data_json);
@@ -876,19 +891,6 @@ router.post("/cards/:id/save", async (req: Request, res: Response) => {
       return;
     }
 
-    // --- Ensure tags exist ONLY on save ---
-    const tagsValue = (normalized as any)?.data?.tags;
-    const tags = Array.isArray(tagsValue)
-      ? tagsValue
-          .map((t: any) => (typeof t === "string" ? t : String(t)))
-          .map((s: string) => s.trim())
-          .filter((s: string) => s.length > 0)
-      : [];
-    if (tags.length > 0) {
-      const tagService = createTagService(db);
-      tagService.ensureTagsExist(tags);
-    }
-
     // keep creator_notes_multilingual.en in sync if present
     const dataObj: any = (normalized as any).data;
     if (
@@ -900,40 +902,6 @@ router.post("/cards/:id/save", async (req: Request, res: Response) => {
         en: dataObj.creator_notes,
       };
     }
-
-    const scanService = createScanService(
-      db,
-      (cardRow.library_id ?? "cards").trim() || "cards",
-      cardRow.is_sillytavern === 1
-    );
-
-    const rewritePngInPlace = async (filePath: string, ccv3Object: unknown) => {
-      const png = await readFile(filePath);
-      const out = buildPngWithCcv3TextChunk({ inputPng: png, ccv3Object });
-      await writeFile(filePath, out);
-    };
-
-    const writeNewPng = async (
-      sourcePngPath: string,
-      targetPngPath: string,
-      ccv3Object: unknown
-    ) => {
-      const png = await readFile(sourcePngPath);
-      const out = buildPngWithCcv3TextChunk({ inputPng: png, ccv3Object });
-      await writeFile(targetPngPath, out);
-    };
-
-    const pickUniquePngPath = (folder: string, baseName: string): string => {
-      const base = sanitizeWindowsFilenameBase(baseName, `card-${id}`);
-      let candidate = join(folder, `${base}.png`);
-      if (!existsSync(candidate)) return candidate;
-      for (let i = 1; i < 1000; i += 1) {
-        candidate = join(folder, `${base} (${i}).png`);
-        if (!existsSync(candidate)) return candidate;
-      }
-      // Should be practically unreachable
-      return join(folder, `${base} (${Date.now()}).png`);
-    };
 
     const addNonceForSaveAsNew = (ccv3Object: any): any => {
       const next = normalizeToCcv3(ccv3Object);
@@ -947,177 +915,66 @@ router.post("/cards/:id/save", async (req: Request, res: Response) => {
       return next;
     };
 
-    const inferStMetaFromPath = (
-      filePath: string
-    ): {
-      stProfileHandle: string;
-      stAvatarFile: string;
-      stAvatarBase: string;
-    } | null => {
-      const p = String(filePath ?? "").trim();
-      if (!p) return null;
-      // Expected: .../data/<profile>/characters/<avatar>.png
-      const m = p.match(
-        /[/\\]data[/\\]([^/\\]+)[/\\]characters[/\\]([^/\\]+\.png)$/i
-      );
-      if (!m) return null;
-      const stProfileHandle = String(m[1] ?? "").trim();
-      const stAvatarFile = String(m[2] ?? "").trim();
-      const stAvatarBase = stAvatarFile.replace(/\.png$/i, "");
-      if (!stProfileHandle || !stAvatarFile) return null;
-      return { stProfileHandle, stAvatarFile, stAvatarBase };
-    };
+    const ctx = await getNextcloudUserContext(db, userId);
+    const mainRemotePath = resolveRemotePathOrThrow(userId, main_file_path);
+    const mainPng = await ctx.client.downloadFile(mainRemotePath);
 
-    const broadcastStCardsChanged = (
-      filePath: string,
-      extra?: Partial<{
-        stProfileHandle: string;
-        stAvatarFile: string;
-        stAvatarBase: string;
-      }>
-    ) => {
-      if (cardRow.is_sillytavern !== 1) return;
-      const inferred = inferStMetaFromPath(filePath);
-      const stProfileHandle = (
-        extra?.stProfileHandle ??
-        inferred?.stProfileHandle ??
-        ""
-      ).trim();
-      const stAvatarFile = (
-        extra?.stAvatarFile ??
-        inferred?.stAvatarFile ??
-        ""
-      ).trim();
-      const stAvatarBase = (
-        extra?.stAvatarBase ??
-        inferred?.stAvatarBase ??
-        ""
-      ).trim();
-
-      const payload = {
-        type: "st:cards_changed" as const,
-        ts: Date.now(),
-        cardId: id,
-        mode,
-        ...(stProfileHandle ? { stProfileHandle } : {}),
-        ...(stAvatarFile ? { stAvatarFile } : {}),
-        ...(stAvatarBase ? { stAvatarBase } : {}),
-      };
-      getHub(req).broadcast("st:cards_changed", payload, { id: payload.ts });
+    const writeRemote = async (remotePath: string, ccv3Object: unknown) => {
+      const out = buildPngWithCcv3TextChunk({
+        inputPng: mainPng,
+        ccv3Object,
+      });
+      await ctx.client.uploadFile(remotePath, out, "image/png");
     };
 
     if (mode === "overwrite_main") {
-      // no duplicates scenario (UI should not show this mode when duplicates exist)
-      await rewritePngInPlace(main_file_path, normalized);
-      await scanService.syncSingleFile(main_file_path);
-      await syncLocalMirrorChangesToNextcloud({
-        db,
-        userId: currentUserId,
-        uploadPaths: [main_file_path],
+      const out = buildPngWithCcv3TextChunk({
+        inputPng: mainPng,
+        ccv3Object: normalized,
       });
-      broadcastStCardsChanged(main_file_path);
+      await ctx.client.uploadFile(mainRemotePath, out, "image/png");
+      await syncUserNextcloudIndex({ db, userId });
       res.json({ ok: true, changed: true, card_id: id });
       return;
     }
 
     if (mode === "overwrite_all_files") {
-      const uploadedPaths: string[] = [];
-      for (const p of file_paths) {
-        if (!p || !existsSync(p)) continue;
-        await rewritePngInPlace(p, normalized);
-        await scanService.syncSingleFile(p);
-        uploadedPaths.push(p);
+      for (const filePath of file_paths) {
+        const remotePath = resolveRemotePathOrThrow(userId, filePath);
+        await writeRemote(remotePath, normalized);
       }
-      await syncLocalMirrorChangesToNextcloud({
-        db,
-        userId: currentUserId,
-        uploadPaths: uploadedPaths,
-      });
-      // One refresh event is enough; use main file to infer profile/avatar.
-      broadcastStCardsChanged(main_file_path);
+      await syncUserNextcloudIndex({ db, userId });
       res.json({ ok: true, changed: true, card_id: id });
       return;
     }
 
     if (mode === "save_new" || mode === "save_new_delete_old_main") {
-      const folder = dirname(main_file_path);
       const nameCandidate =
         typeof (normalized as any)?.data?.name === "string"
           ? String((normalized as any).data.name)
           : "";
-      const targetPath = pickUniquePngPath(folder, nameCandidate);
+      const remoteFolder = pathPosix.dirname(mainRemotePath);
+      const targetRemotePath = await pickUniqueRemotePngPath({
+        client: ctx.client,
+        folder: remoteFolder,
+        baseName: sanitizeWindowsFilenameBase(nameCandidate, `card-${id}`),
+      });
 
       const withNonce = addNonceForSaveAsNew(normalized);
-      await writeNewPng(main_file_path, targetPath, withNonce);
-      const stMeta =
-        cardRow.is_sillytavern === 1 ? inferStMetaFromPath(targetPath) : null;
-      await scanService.syncSingleFile(targetPath, stMeta ?? undefined);
-      await syncLocalMirrorChangesToNextcloud({
-        db,
-        userId: currentUserId,
-        uploadPaths: [targetPath],
-      });
-      broadcastStCardsChanged(targetPath, stMeta ?? undefined);
-
-      const newRow = db
-        .prepare(`SELECT card_id FROM card_files WHERE file_path = ? LIMIT 1`)
-        .get(targetPath) as { card_id: string } | undefined;
-      if (!newRow?.card_id) {
-        throw new AppError({ status: 500, code: "api.cards.save_failed" });
-      }
+      await writeRemote(targetRemotePath, withNonce);
 
       if (mode === "save_new_delete_old_main") {
-        const oldPath = main_file_path;
+        await ctx.client.deleteFile(mainRemotePath);
+      }
 
-        // Same semantics as DELETE /api/cards/:id/files, but for the main file.
-        const before = db
-          .prepare(
-            `
-            SELECT COUNT(*) as cnt
-            FROM card_files
-            WHERE card_id = ?
-          `
-          )
-          .get(id) as { cnt: number };
+      await syncUserNextcloudIndex({ db, userId });
 
-        db.transaction(() => {
-          db.prepare(`DELETE FROM card_files WHERE file_path = ?`).run(oldPath);
-
-          const after = db
-            .prepare(
-              `
-              SELECT COUNT(*) as cnt
-              FROM card_files
-              WHERE card_id = ?
-            `
-            )
-            .get(id) as { cnt: number };
-
-          if ((after?.cnt ?? 0) === 0) {
-            db.prepare(`DELETE FROM cards WHERE id = ?`).run(id);
-          }
-        })();
-
-        await unlink(oldPath).catch((e: any) => {
-          if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return;
-          throw e;
-        });
-        await syncLocalMirrorChangesToNextcloud({
-          db,
-          userId: currentUserId,
-          deletePaths: [oldPath],
-        });
-
-        // If we deleted the last file, clean thumbnail
-        if ((before?.cnt ?? 0) <= 1 && cardRow.avatar_path) {
-          const uuid = cardRow.avatar_path
-            .split("/")
-            .pop()
-            ?.replace(".webp", "");
-          if (uuid) {
-            await deleteThumbnail(uuid);
-          }
-        }
+      const targetVirtualPath = toNextcloudVirtualPath(userId, targetRemotePath);
+      const newRow = db
+        .prepare(`SELECT card_id FROM card_files WHERE file_path = ? LIMIT 1`)
+        .get(targetVirtualPath) as { card_id: string } | undefined;
+      if (!newRow?.card_id) {
+        throw new AppError({ status: 500, code: "api.cards.save_failed" });
       }
 
       res.json({ ok: true, changed: true, card_id: newRow.card_id });
@@ -1125,37 +982,22 @@ router.post("/cards/:id/save", async (req: Request, res: Response) => {
     }
 
     if (mode === "save_new_to_library") {
-      const settings = await getSettingsForUser(req.currentUser?.id ?? null);
-      const targetFolderPath = (settings.cardsFolderPath ?? "").trim();
-      if (!targetFolderPath) {
-        throw new AppError({
-          status: 409,
-          code: "api.cards.cardsFolderPath_not_set",
-        });
-      }
-
       const nameCandidate =
         typeof (normalized as any)?.data?.name === "string"
           ? String((normalized as any).data.name)
           : "";
-      const targetPath = pickUniquePngPath(targetFolderPath, nameCandidate);
-
-      // Save the *current* card JSON into a new PNG in the main library folder.
-      // No nonce: let scan+hash dedup decide whether it's a duplicate or a new card.
-      await writeNewPng(main_file_path, targetPath, normalized);
-
-      const libraryId = getOrCreateLibraryId(db, targetFolderPath);
-      const libraryScan = createScanService(db, libraryId, false);
-      await libraryScan.syncSingleFile(targetPath);
-      await syncLocalMirrorChangesToNextcloud({
-        db,
-        userId: currentUserId,
-        uploadPaths: [targetPath],
+      const targetRemotePath = await pickUniqueRemotePngPath({
+        client: ctx.client,
+        folder: ctx.remoteFolder,
+        baseName: sanitizeWindowsFilenameBase(nameCandidate, `card-${id}`),
       });
+      await writeRemote(targetRemotePath, normalized);
+      await syncUserNextcloudIndex({ db, userId });
 
+      const targetVirtualPath = toNextcloudVirtualPath(userId, targetRemotePath);
       const newRow = db
         .prepare(`SELECT card_id FROM card_files WHERE file_path = ? LIMIT 1`)
-        .get(targetPath) as { card_id: string } | undefined;
+        .get(targetVirtualPath) as { card_id: string } | undefined;
       if (!newRow?.card_id) {
         throw new AppError({ status: 500, code: "api.cards.save_failed" });
       }
@@ -1184,8 +1026,8 @@ router.delete("/cards/:id/files", async (req: Request, res: Response) => {
     }
 
     const db = getDb(req);
-    const currentUserId = req.currentUser?.id ?? null;
-    const libraryIds = await resolveUserLibraryIds(db, req.currentUser?.id ?? null);
+    const userId = getCurrentUserId(req);
+    const libraryIds = await resolveUserLibraryIds(db, userId);
     ensureCardInLibraries(db, id, libraryIds);
     const normalizedFilePath = file_path.trim();
 
@@ -1245,6 +1087,10 @@ router.delete("/cards/:id/files", async (req: Request, res: Response) => {
       .prepare(`SELECT avatar_path FROM cards WHERE id = ? LIMIT 1`)
       .get(id) as { avatar_path: string | null } | undefined;
 
+    const ctx = await getNextcloudUserContext(db, userId);
+    const remotePath = resolveRemotePathOrThrow(userId, normalizedFilePath);
+    await ctx.client.deleteFile(remotePath);
+
     // Транзакция: сначала удаляем привязку файла, затем (опционально) карточку
     db.transaction(() => {
       db.prepare(`DELETE FROM card_files WHERE file_path = ?`).run(
@@ -1265,17 +1111,6 @@ router.delete("/cards/:id/files", async (req: Request, res: Response) => {
         db.prepare(`DELETE FROM cards WHERE id = ?`).run(id);
       }
     })();
-
-    // Удаляем файл с диска (best-effort): если уже удалён — ок.
-    await unlink(normalizedFilePath).catch((e: any) => {
-      if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return;
-      throw e;
-    });
-    await syncLocalMirrorChangesToNextcloud({
-      db,
-      userId: currentUserId,
-      deletePaths: [normalizedFilePath],
-    });
 
     // Notify ST about deletion (best-effort)
     if (stMetaForDeletedFile?.is_sillytavern === 1) {
@@ -1458,8 +1293,8 @@ router.post("/cards/bulk-delete", async (req: Request, res: Response) => {
     }
 
     const db = getDb(req);
-    const currentUserId = req.currentUser?.id ?? null;
-    const libraryIds = await resolveUserLibraryIds(db, req.currentUser?.id ?? null);
+    const userId = getCurrentUserId(req);
+    const libraryIds = await resolveUserLibraryIds(db, userId);
     if (libraryIds.length === 0) {
       throw new AppError({ status: 404, code: "api.cards.some_not_found" });
     }
@@ -1505,23 +1340,16 @@ router.post("/cards/bulk-delete", async (req: Request, res: Response) => {
       if (list) list.push(p);
     }
 
-    // 1) Delete files first. If a critical filesystem error happens, do not touch DB.
+    const ctx = await getNextcloudUserContext(db, userId);
+
+    // 1) Delete files in Nextcloud first. If a critical error happens, do not touch DB.
     for (const id of card_ids) {
       const files = filesByCardId.get(id) ?? [];
       for (const p of files) {
-        await unlink(p).catch((e: unknown) => {
-          const err = e as { code?: unknown } | null;
-          const code = typeof err?.code === "string" ? err.code : "";
-          if (code === "ENOENT" || code === "ENOTDIR") return;
-          throw e;
-        });
+        const remotePath = resolveRemotePathOrThrow(userId, p);
+        await ctx.client.deleteFile(remotePath);
       }
     }
-    await syncLocalMirrorChangesToNextcloud({
-      db,
-      userId: currentUserId,
-      deletePaths: fileRows.map((r) => r.file_path),
-    });
 
     // 2) Remove cards from DB (card_files/card_tags are removed via cascade)
     db.transaction(() => {
@@ -1553,8 +1381,8 @@ router.delete("/cards/:id", async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const db = getDb(req);
-    const currentUserId = req.currentUser?.id ?? null;
-    const libraryIds = await resolveUserLibraryIds(db, req.currentUser?.id ?? null);
+    const userId = getCurrentUserId(req);
+    const libraryIds = await resolveUserLibraryIds(db, userId);
     ensureCardInLibraries(db, id, libraryIds);
     const deleteChatsRequested = parseTruthyQueryFlag((req.query as any)?.delete_chats);
 
@@ -1613,20 +1441,15 @@ router.delete("/cards/:id", async (req: Request, res: Response) => {
       .map((r) => r.file_path)
       .filter((p) => typeof p === "string" && p.trim().length > 0);
 
-    // Сначала удаляем файлы с диска. Если есть критичная ошибка — не трогаем БД.
+    const ctx = await getNextcloudUserContext(db, userId);
+
+    // Сначала удаляем файлы в Nextcloud. Если есть критичная ошибка — не трогаем БД.
     for (const p of file_paths) {
       const normalized = p.trim();
       if (!normalized) continue;
-      await unlink(normalized).catch((e: any) => {
-        if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return;
-        throw e;
-      });
+      const remotePath = resolveRemotePathOrThrow(userId, normalized);
+      await ctx.client.deleteFile(remotePath);
     }
-    await syncLocalMirrorChangesToNextcloud({
-      db,
-      userId: currentUserId,
-      deletePaths: file_paths,
-    });
 
     // Optional: delete SillyTavern chats folder (best-effort)
     if (shouldDeleteChats) {
@@ -1772,8 +1595,8 @@ router.put(
       }
 
       const db = getDb(req);
-      const currentUserId = req.currentUser?.id ?? null;
-      const libraryIds = await resolveUserLibraryIds(db, req.currentUser?.id ?? null);
+      const userId = getCurrentUserId(req);
+      const libraryIds = await resolveUserLibraryIds(db, userId);
       ensureCardInLibraries(db, id, libraryIds);
 
       // main file = COALESCE(primary_file_path, oldest)
@@ -1809,21 +1632,30 @@ router.put(
       }
 
       const oldPath = row.main_file_path;
-      if (!existsSync(oldPath)) {
-        throw new AppError({ status: 404, code: "api.image.file_not_found" });
-      }
+      const oldRemotePath = resolveRemotePathOrThrow(userId, oldPath);
+      const ctx = await getNextcloudUserContext(db, userId);
 
       const rawBase = filename.trim().replace(/\.png$/i, "");
       const base = sanitizeWindowsFilenameBase(rawBase, `card-${id}`);
-      const nextPath = join(dirname(oldPath), `${base}.png`);
+      const nextRemotePath = pathPosix.join(
+        pathPosix.dirname(oldRemotePath),
+        `${base}.png`
+      );
+      const nextPath = toNextcloudVirtualPath(userId, nextRemotePath);
 
-      // No-op (в т.ч. на Windows с нечувствительностью к регистру)
-      if (nextPath.toLowerCase() === oldPath.toLowerCase()) {
+      if (nextRemotePath.toLowerCase() === oldRemotePath.toLowerCase()) {
         res.json({ ok: true });
         return;
       }
 
-      if (existsSync(nextPath)) {
+      const siblingEntries = await ctx.client.listFolder(
+        pathPosix.dirname(oldRemotePath)
+      );
+      const targetName = pathPosix.basename(nextRemotePath).toLowerCase();
+      const targetExists = siblingEntries.some(
+        (entry) => !entry.isDirectory && entry.name.toLowerCase() === targetName
+      );
+      if (targetExists) {
         throw new AppError({
           status: 409,
           code: "api.cards.rename_target_exists",
@@ -1844,22 +1676,15 @@ router.put(
         | { file_mtime: number; file_birthtime: number; file_size: number }
         | undefined;
 
-      // 1) rename на диске
-      await rename(oldPath, nextPath);
+      const oldBinary = await ctx.client.downloadFile(oldRemotePath);
+      await ctx.client.uploadFile(nextRemotePath, oldBinary, "image/png");
+      await ctx.client.deleteFile(oldRemotePath);
 
       // 2) обновляем БД
       const folderPath = dirname(nextPath);
-      const stats = statSync(nextPath);
-      const fileMtime = Number.isFinite(stats.mtimeMs)
-        ? stats.mtimeMs
-        : cf?.file_mtime ?? Date.now();
-      const fileBirthtime =
-        Number.isFinite(stats.birthtimeMs) && stats.birthtimeMs > 0
-          ? stats.birthtimeMs
-          : cf?.file_birthtime ?? fileMtime;
-      const fileSize = Number.isFinite(stats.size)
-        ? stats.size
-        : cf?.file_size ?? 0;
+      const fileMtime = Date.now();
+      const fileBirthtime = cf?.file_birthtime ?? fileMtime;
+      const fileSize = oldBinary.length;
 
       db.transaction(() => {
         db.prepare(
@@ -1891,12 +1716,6 @@ router.put(
       `
         ).run(nextPath, id, oldPath);
       })();
-      await syncLocalMirrorChangesToNextcloud({
-        db,
-        userId: currentUserId,
-        uploadPaths: [nextPath],
-        deletePaths: [oldPath],
-      });
 
       res.json({ ok: true, file_path: nextPath });
     } catch (error) {

@@ -3,8 +3,7 @@ import { createHash } from "node:crypto";
 import type { SseHub } from "./sse-hub";
 import { getPatternRules, type PatternRule } from "./pattern-rules";
 import { canonicalizeForHash } from "./card-hash";
-import { getSettingsForUser } from "./settings";
-import { getOrCreateLibraryId } from "./libraries";
+import { resolveUserLibraryIds } from "./user-libraries";
 import { logger } from "../utils/logger";
 
 export type PatternRunStartedEvent = {
@@ -80,7 +79,12 @@ export async function startPatternRulesRun(opts: {
   runId: string;
   userId: string | null;
 }): Promise<{ rules_hash: string; job: Promise<void> }> {
-  const file = await getPatternRules();
+  const userId = String(opts.userId ?? "").trim();
+  if (!userId) {
+    throw new Error("Pattern rules run requires authenticated user");
+  }
+
+  const file = await getPatternRules(opts.db, userId);
   const activeRules = file.rules.filter((r) => r.enabled);
   const rulesHash = computeRulesHash(activeRules);
 
@@ -89,16 +93,15 @@ export async function startPatternRulesRun(opts: {
     re: new RegExp(r.pattern, r.flags),
   }));
 
-  const settings = await getSettingsForUser(opts.userId);
-  const folderPath = settings.cardsFolderPath;
+  const libraryIds = await resolveUserLibraryIds(opts.db, userId);
+  const libraryId = libraryIds[0] ?? null;
 
   const job = (async () => {
     const startedAt = Date.now();
     try {
-      if (!folderPath) {
-        throw new Error("cardsFolderPath is not set");
+      if (!libraryId) {
+        throw new Error("Nextcloud library is not available");
       }
-      const libraryId = getOrCreateLibraryId(opts.db, folderPath);
 
       const totalRow = opts.db
         .prepare(`SELECT COUNT(*) as cnt FROM cards WHERE library_id = ?`)
@@ -120,19 +123,21 @@ export async function startPatternRulesRun(opts: {
         opts.db
           .prepare(
             `
-            INSERT INTO pattern_rules_cache(rules_hash, created_at, status, error)
-            VALUES (?, ?, 'building', NULL)
-            ON CONFLICT(rules_hash) DO UPDATE SET
+            INSERT INTO user_pattern_rules_cache(user_id, rules_hash, created_at, status, error)
+            VALUES (?, ?, ?, 'building', NULL)
+            ON CONFLICT(user_id, rules_hash) DO UPDATE SET
               created_at = excluded.created_at,
               status = excluded.status,
               error = NULL
           `
           )
-          .run(rulesHash, startedAt);
+          .run(userId, rulesHash, startedAt);
 
         opts.db
-          .prepare(`DELETE FROM pattern_matches WHERE rules_hash = ?`)
-          .run(rulesHash);
+          .prepare(
+            `DELETE FROM user_pattern_matches WHERE user_id = ? AND rules_hash = ?`
+          )
+          .run(userId, rulesHash);
       })();
 
       // Fast path: nothing to scan (no cards or no enabled rules)
@@ -140,12 +145,12 @@ export async function startPatternRulesRun(opts: {
         opts.db
           .prepare(
             `
-            UPDATE pattern_rules_cache
+            UPDATE user_pattern_rules_cache
             SET status = 'ready', error = NULL
-            WHERE rules_hash = ?
+            WHERE user_id = ? AND rules_hash = ?
           `
           )
-          .run(rulesHash);
+          .run(userId, rulesHash);
 
         opts.hub.broadcast(
           "patterns:run_done",
@@ -179,8 +184,8 @@ export async function startPatternRulesRun(opts: {
 
       const insertMatch = opts.db.prepare(
         `
-        INSERT INTO pattern_matches(rules_hash, card_id, matched_rules, updated_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO user_pattern_matches(user_id, rules_hash, card_id, matched_rules, updated_at)
+        VALUES (?, ?, ?, ?, ?)
       `
       );
 
@@ -189,7 +194,7 @@ export async function startPatternRulesRun(opts: {
           items: Array<{ cardId: string; matchedRules: string; ts: number }>
         ) => {
           for (const it of items) {
-            insertMatch.run(rulesHash, it.cardId, it.matchedRules, it.ts);
+            insertMatch.run(userId, rulesHash, it.cardId, it.matchedRules, it.ts);
           }
         }
       );
@@ -266,12 +271,12 @@ export async function startPatternRulesRun(opts: {
       opts.db
         .prepare(
           `
-          UPDATE pattern_rules_cache
+          UPDATE user_pattern_rules_cache
           SET status = 'ready', error = NULL
-          WHERE rules_hash = ?
+          WHERE user_id = ? AND rules_hash = ?
         `
         )
-        .run(rulesHash);
+        .run(userId, rulesHash);
 
       opts.hub.broadcast(
         "patterns:run_done",
@@ -288,15 +293,15 @@ export async function startPatternRulesRun(opts: {
         opts.db
           .prepare(
             `
-            INSERT INTO pattern_rules_cache(rules_hash, created_at, status, error)
-            VALUES (?, ?, 'failed', ?)
-            ON CONFLICT(rules_hash) DO UPDATE SET
+            INSERT INTO user_pattern_rules_cache(user_id, rules_hash, created_at, status, error)
+            VALUES (?, ?, ?, 'failed', ?)
+            ON CONFLICT(user_id, rules_hash) DO UPDATE SET
               created_at = excluded.created_at,
               status = excluded.status,
               error = excluded.error
           `
           )
-          .run(rulesHash, Date.now(), message);
+          .run(userId, rulesHash, Date.now(), message);
       } catch (inner) {
         logger.errorKey(inner, "error.pattern_rules.cache_update_failed");
       }

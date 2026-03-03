@@ -13,7 +13,7 @@ import { listSillyTavernProfileCharactersDirs } from "../services/sillytavern";
 export async function initializeScanner(db: Database.Database): Promise<void> {
   // Читаем настройки
   try {
-    const settings = await getSettings();
+    const settings = await getSettings(db);
 
     // Если cardsFolderPath указан и папка существует, запускаем сканирование
     if (
@@ -41,7 +41,7 @@ export async function initializeScannerWithOrchestrator(
   db: Database.Database
 ): Promise<void> {
   try {
-    const settings = await getSettings();
+    const settings = await getSettings(db);
     if (
       settings.cardsFolderPath !== null &&
       existsSync(settings.cardsFolderPath)

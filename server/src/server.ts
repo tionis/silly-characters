@@ -2,13 +2,13 @@ import "./config/env";
 import { createApp } from "./app";
 import { initializeScannerWithOrchestrator } from "./plugins/scanner";
 import { logger } from "./utils/logger";
-import Database from "better-sqlite3";
 import { getSettings } from "./services/settings";
 import type { SseHub } from "./services/sse-hub";
 import type { FsWatcherService } from "./services/fs-watcher";
 import type { CardsSyncOrchestrator } from "./services/cards-sync-orchestrator";
 import { setCurrentLanguage } from "./i18n/language";
 import { buildWatchTargets } from "./services/watch-targets";
+import { startCacheGcJob } from "./services/cache-gc";
 
 function readPort(
   ...candidates: Array<string | undefined>
@@ -20,6 +20,17 @@ function readPort(
     if (Number.isFinite(v) && v > 0 && v <= 65535) return v;
   }
   return undefined;
+}
+
+function readPositiveInt(
+  value: string | undefined,
+  fallback: number
+): number {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
 }
 
 // Порт/хост SillyCharacters
@@ -40,6 +51,18 @@ const HOST =
   ).trim() || "127.0.0.1";
 const ENABLE_BOOT_SCAN =
   String(process.env.ENABLE_BOOT_SCAN ?? "").trim().toLowerCase() === "true";
+const CACHE_GC_INTERVAL_MS = readPositiveInt(
+  process.env.CACHE_GC_INTERVAL_MS,
+  15 * 60 * 1000
+);
+const CACHE_GC_MIN_AGE_MS = readPositiveInt(
+  process.env.CACHE_GC_MIN_AGE_MS,
+  60 * 60 * 1000
+);
+const CACHE_GC_INITIAL_DELAY_MS = readPositiveInt(
+  process.env.CACHE_GC_INITIAL_DELAY_MS,
+  30 * 1000
+);
 
 async function startServer(): Promise<void> {
   try {
@@ -49,10 +72,15 @@ async function startServer(): Promise<void> {
     const fsWatcher = (app.locals as any).fsWatcher as FsWatcherService;
     const orchestrator = (app.locals as any)
       .cardsSyncOrchestrator as CardsSyncOrchestrator;
+    const cacheGc = startCacheGcJob(db, {
+      intervalMs: CACHE_GC_INTERVAL_MS,
+      minUnreferencedAgeMs: CACHE_GC_MIN_AGE_MS,
+      initialDelayMs: CACHE_GC_INITIAL_DELAY_MS,
+    });
 
     // Инициализируем язык (для локализации логов/ошибок)
     try {
-      const settings = await getSettings();
+      const settings = await getSettings(db);
       setCurrentLanguage(settings.language);
     } catch (error) {
       logger.errorKey(error, "log.server.readLanguageSettingsFailed");
@@ -68,7 +96,7 @@ async function startServer(): Promise<void> {
           logger.errorKey(error, "log.server.initScannerFailed");
         });
 
-        getSettings()
+        getSettings(db)
           .then((settings) => {
             fsWatcher.syncTargets(buildWatchTargets(settings, db));
           })
@@ -87,6 +115,7 @@ async function startServer(): Promise<void> {
 
         // Закрываем SSE и watcher
         try {
+          cacheGc.stop();
           fsWatcher.stopAll();
           sseHub.closeAll();
         } catch (error) {

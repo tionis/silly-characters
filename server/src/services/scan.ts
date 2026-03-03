@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { statSync, existsSync } from "node:fs";
 import { join, extname, dirname } from "node:path";
-import { readdir as readdirAsync, writeFile, ensureDir } from "fs-extra";
+import { readdir as readdirAsync } from "fs-extra";
 import pLimit from "p-limit";
 import { randomUUID } from "node:crypto";
 import { createDatabaseService, DatabaseService } from "./database";
@@ -1004,47 +1004,6 @@ export class ScanService {
           }
         }
       });
-
-      // Сохраняем JSON файл с данными карточки (только если включено через переменную окружения)
-      if (process.env.ENABLE_JSON_CACHE === "true") {
-        const jsonDir = join(process.cwd(), "data", "cache", "json");
-        await ensureDir(jsonDir);
-        const jsonPath = join(jsonDir, `${cardId}.json`);
-        const jsonData = {
-          db: {
-            id: cardId,
-            cardId,
-            name,
-            description,
-            tags,
-            creator,
-            specVersion,
-            avatarPath,
-            createdAt,
-            dataJson: extractedData.original_data,
-            personality,
-            scenario,
-            firstMes,
-            mesExample,
-            creatorNotes,
-            systemPrompt,
-            postHistoryInstructions,
-            alternateGreetingsCount,
-            hasCreatorNotes,
-            hasSystemPrompt,
-            hasPostHistoryInstructions,
-            hasPersonality,
-            hasScenario,
-            hasMesExample,
-            hasCharacterBook,
-          },
-          raw: {
-            data: extractedData.original_data,
-            spec_version: specVersion,
-          },
-        };
-        await writeFile(jsonPath, JSON.stringify(jsonData, null, 2), "utf-8");
-      }
 
       // В редких случаях гонки, если карточка была создана параллельно без avatar_path,
       // попробуем добить миниатюру уже после транзакции.

@@ -2,21 +2,22 @@ import { Router, type Request, type Response } from "express";
 import type Database from "better-sqlite3";
 import multer from "multer";
 import { randomUUID } from "node:crypto";
+import { extname, join } from "node:path";
+import { readFile } from "node:fs/promises";
 import type { SseHub } from "../../services/sse-hub";
-import type { CardsSyncOrchestrator } from "../../services/cards-sync-orchestrator";
 import { AppError } from "../../errors/app-error";
 import { sendError } from "../../errors/http";
 import { logger } from "../../utils/logger";
-import { getSettingsForUser } from "../../services/settings";
-import { getOrCreateLibraryId } from "../../services/libraries";
-import { existsSync } from "node:fs";
 import { createDatabaseService } from "../../services/database";
 import { CardParser } from "../../services/card-parser";
 import { computeContentHash } from "../../services/card-hash";
-import { ensureDir, move, remove } from "fs-extra";
-import { extname, join } from "node:path";
+import { remove } from "fs-extra";
 import { sanitizeWindowsFilenameBase } from "../../utils/filename";
-import { syncLocalMirrorChangesToNextcloud } from "../../services/nextcloud-mirror-write";
+import {
+  getNextcloudUserContext,
+  pickUniqueRemotePngPath,
+} from "../../services/nextcloud-storage";
+import { syncUserNextcloudIndex } from "../../services/nextcloud-index";
 
 const router = Router();
 const upload = multer({
@@ -37,14 +38,6 @@ function getHub(req: Request): SseHub {
   return hub;
 }
 
-function getOrchestrator(req: Request): CardsSyncOrchestrator {
-  const o = (req.app.locals as any).cardsSyncOrchestrator as
-    | CardsSyncOrchestrator
-    | undefined;
-  if (!o) throw new Error("CardsSyncOrchestrator is not initialized");
-  return o;
-}
-
 type ImportRunState = { running: boolean };
 type DuplicatesMode = "skip" | "copy";
 
@@ -57,17 +50,6 @@ function getState(req: Request): ImportRunState {
 function parseDuplicatesMode(raw: unknown): DuplicatesMode | null {
   if (raw === "skip" || raw === "copy") return raw;
   return null;
-}
-
-function pickUniquePngPath(folder: string, baseName: string): string {
-  const base = sanitizeWindowsFilenameBase(baseName, "uploaded-card");
-  let candidate = join(folder, `${base}.png`);
-  if (!existsSync(candidate)) return candidate;
-  for (let i = 1; i < 1000; i += 1) {
-    candidate = join(folder, `${base} (${i}).png`);
-    if (!existsSync(candidate)) return candidate;
-  }
-  return join(folder, `${base} (${Date.now()}).png`);
 }
 
 router.post(
@@ -98,25 +80,14 @@ router.post(
         throw new AppError({ status: 401, code: "api.auth.unauthorized" });
       }
 
-      const settings = await getSettingsForUser(userId);
-      const targetFolderPath = settings.cardsFolderPath;
-      if (!targetFolderPath) {
-        throw new AppError({
-          status: 400,
-          code: "api.cardsImport.cardsFolderPath_not_set",
-        });
-      }
-
-      await ensureDir(targetFolderPath);
-
       const db = getDb(req);
       const hub = getHub(req);
-      const orchestrator = getOrchestrator(req);
-      const libraryId = getOrCreateLibraryId(db, targetFolderPath);
+      const ctx = await getNextcloudUserContext(db, userId);
+      await ctx.client.ensureFolderExists(ctx.remoteFolder);
+
       const dbService = createDatabaseService(db);
       const parser = new CardParser();
       const knownDuplicateHashes = new Set<string>();
-      const importedPaths: string[] = [];
 
       const startedAt = Date.now();
       let processedFiles = 0;
@@ -143,18 +114,16 @@ router.post(
           continue;
         }
 
-        const baseName = originalName.replace(/\.png$/i, "");
-        const targetPath = pickUniquePngPath(targetFolderPath, baseName);
-        let movedToTarget = false;
+        const baseName = sanitizeWindowsFilenameBase(
+          originalName.replace(/\.png$/i, ""),
+          "uploaded-card"
+        );
 
         try {
-          await move(file.path, targetPath, { overwrite: false });
-          movedToTarget = true;
-
-          const extracted = parser.parse(targetPath);
+          const extracted = parser.parse(file.path);
           if (!extracted) {
             skippedParseErrors += 1;
-            await remove(targetPath).catch(() => undefined);
+            await remove(file.path).catch(() => undefined);
             continue;
           }
 
@@ -162,58 +131,52 @@ router.post(
           if (duplicatesMode === "skip") {
             if (knownDuplicateHashes.has(contentHash)) {
               skippedDuplicates += 1;
-              await remove(targetPath).catch(() => undefined);
+              await remove(file.path).catch(() => undefined);
               continue;
             }
 
             const exists = dbService.queryOne<{ one: number }>(
               `SELECT 1 as one FROM cards WHERE library_id = ? AND content_hash = ? LIMIT 1`,
-              [libraryId, contentHash]
+              [ctx.libraryId, contentHash]
             );
             if (exists) {
               knownDuplicateHashes.add(contentHash);
               skippedDuplicates += 1;
-              await remove(targetPath).catch(() => undefined);
+              await remove(file.path).catch(() => undefined);
               continue;
             }
 
             knownDuplicateHashes.add(contentHash);
           }
 
+          const remotePath = await pickUniqueRemotePngPath({
+            client: ctx.client,
+            folder: ctx.remoteFolder,
+            baseName,
+          });
+
+          const content = await readFile(file.path);
+          await ctx.client.uploadFile(remotePath, content, "image/png");
           importedFiles += 1;
-          importedPaths.push(targetPath);
         } catch (error) {
           copyFailed += 1;
           logger.errorKey(error, "error.cardsImport.copyFailed", {
             source: file.path,
-            target: targetPath,
+            target: ctx.remoteFolder,
           });
-          if (movedToTarget) {
-            await remove(targetPath).catch(() => undefined);
-          } else {
-            await remove(file.path).catch(() => undefined);
-          }
+        } finally {
+          await remove(file.path).catch(() => undefined);
         }
       }
 
-      try {
-        orchestrator.requestScan("app", targetFolderPath, libraryId);
-      } catch (error) {
-        logger.errorKey(error, "error.cardsImport.requestScanFailed");
-      }
-
-      await syncLocalMirrorChangesToNextcloud({
-        db,
-        userId,
-        uploadPaths: importedPaths,
-      });
+      await syncUserNextcloudIndex({ db, userId });
 
       const finishedAt = Date.now();
       hub.broadcast(
         "cards:import_finished",
         {
           sourceFolderPath: "[uploaded-from-browser]",
-          targetFolderPath,
+          targetFolderPath: ctx.remoteFolder,
           importMode: "copy",
           duplicatesMode,
           totalFiles: uploadedFiles.length,

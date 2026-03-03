@@ -13,6 +13,8 @@ This project is heavily based on the original
 - Bun-first monorepo
 - `server`: Express + TypeScript API
 - `client`: React + Vite frontend
+- Nextcloud as source-of-truth for card PNG files (no local mirror)
+- SQLite as per-user metadata/index cache
 - `apps/*`, `packages/*`: early experimental workspace scaffolding
 
 ## Quick Start

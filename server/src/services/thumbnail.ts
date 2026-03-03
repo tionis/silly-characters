@@ -36,6 +36,26 @@ export async function generateThumbnail(
   }
 }
 
+export async function generateThumbnailFromBuffer(
+  sourceBuffer: Buffer,
+  uuid: string
+): Promise<string | null> {
+  try {
+    await ensureDir(THUMBNAILS_DIR);
+    const thumbnailPath = join(THUMBNAILS_DIR, `${uuid}.webp`);
+    await sharp(sourceBuffer)
+      .resize({ width: 300, withoutEnlargement: true })
+      .webp({ quality: 80 })
+      .toFile(thumbnailPath);
+    return `cache/thumbnails/${uuid}.webp`;
+  } catch (error) {
+    logger.errorKey(error, "error.thumbnail.generateFailed", {
+      sourcePath: "[buffer]",
+    });
+    return null;
+  }
+}
+
 /**
  * Удаляет миниатюру карточки
  * @param uuid UUID карточки

@@ -1,5 +1,4 @@
-import { readFile, writeFile, ensureDir } from "fs-extra";
-import { join } from "node:path";
+import type Database from "better-sqlite3";
 import { AppError } from "../errors/app-error";
 
 export type ColumnsCount = 3 | 5 | 7;
@@ -11,23 +10,17 @@ export interface ViewSettings {
   colorScheme: ColorScheme;
 }
 
-const VIEW_SETTINGS_FILE_PATH = join(
-  process.cwd(),
-  "data",
-  "view-settings.json"
-);
-
 const DEFAULT_SETTINGS: ViewSettings = {
   columnsCount: 5,
   isCensored: false,
   colorScheme: "auto",
 };
 
-/**
- * Валидирует значение columnsCount
- * @param value Значение для проверки
- * @returns true если значение валидно
- */
+function normalizeUserId(userId?: string | null): string | null {
+  const normalized = typeof userId === "string" ? userId.trim() : "";
+  return normalized.length > 0 ? normalized : null;
+}
+
 function isValidColumnsCount(value: number): value is ColumnsCount {
   return value === 3 || value === 5 || value === 7;
 }
@@ -36,70 +29,107 @@ function isValidColorScheme(value: unknown): value is ColorScheme {
   return value === "light" || value === "dark" || value === "auto";
 }
 
-/**
- * Читает настройки отображения из файла. Если файл не существует, создает его с дефолтными значениями.
- * @returns Текущие настройки отображения
- */
-export async function getViewSettings(): Promise<ViewSettings> {
-  try {
-    const data = await readFile(VIEW_SETTINGS_FILE_PATH, "utf-8");
-    const parsed = JSON.parse(data) as Partial<ViewSettings>;
-
-    // Валидация данных
-    if (
-      typeof parsed.columnsCount === "number" &&
-      isValidColumnsCount(parsed.columnsCount) &&
-      typeof parsed.isCensored === "boolean" &&
-      (parsed.colorScheme === undefined ||
-        isValidColorScheme(parsed.colorScheme))
-    ) {
-      return {
-        columnsCount: parsed.columnsCount,
-        isCensored: parsed.isCensored,
-        colorScheme: parsed.colorScheme ?? DEFAULT_SETTINGS.colorScheme,
-      };
-    }
-
-    // Если данные невалидны, возвращаем дефолтные значения
-    return DEFAULT_SETTINGS;
-  } catch (error) {
-    // Если файл не существует, создаем его с дефолтными значениями
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      await ensureDir(join(process.cwd(), "data"));
-      await writeFile(
-        VIEW_SETTINGS_FILE_PATH,
-        JSON.stringify(DEFAULT_SETTINGS, null, 2),
-        "utf-8"
-      );
-      return DEFAULT_SETTINGS;
-    }
-    throw error;
-  }
-}
-
-/**
- * Обновляет настройки отображения с валидацией
- * @param newSettings Новые настройки отображения
- * @throws Error если данные невалидны
- */
-export async function updateViewSettings(
-  newSettings: ViewSettings
-): Promise<ViewSettings> {
-  const normalized: ViewSettings = {
-    columnsCount: newSettings?.columnsCount,
-    isCensored: newSettings?.isCensored,
-    colorScheme: isValidColorScheme(newSettings?.colorScheme)
-      ? newSettings.colorScheme
+function normalizeViewSettings(raw: unknown): ViewSettings {
+  const src = (typeof raw === "object" && raw !== null ? raw : {}) as Partial<ViewSettings>;
+  return {
+    columnsCount:
+      typeof src.columnsCount === "number" && isValidColumnsCount(src.columnsCount)
+        ? src.columnsCount
+        : DEFAULT_SETTINGS.columnsCount,
+    isCensored:
+      typeof src.isCensored === "boolean"
+        ? src.isCensored
+        : DEFAULT_SETTINGS.isCensored,
+    colorScheme: isValidColorScheme(src.colorScheme)
+      ? src.colorScheme
       : DEFAULT_SETTINGS.colorScheme,
   };
+}
 
-  // Валидация данных
+type ViewSettingsRow = {
+  columns_count: number;
+  is_censored: number;
+  color_scheme: string;
+};
+
+function rowToViewSettings(row: ViewSettingsRow): ViewSettings {
+  return normalizeViewSettings({
+    columnsCount: row.columns_count,
+    isCensored: row.is_censored === 1,
+    colorScheme: row.color_scheme,
+  });
+}
+
+function upsertViewSettingsRow(
+  db: Database.Database,
+  userId: string,
+  settings: ViewSettings
+): void {
+  const now = Date.now();
+  db.prepare(
+    `
+      INSERT INTO user_view_settings (
+        user_id,
+        columns_count,
+        is_censored,
+        color_scheme,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        columns_count = excluded.columns_count,
+        is_censored = excluded.is_censored,
+        color_scheme = excluded.color_scheme,
+        updated_at = excluded.updated_at
+    `
+  ).run(
+    userId,
+    settings.columnsCount,
+    settings.isCensored ? 1 : 0,
+    settings.colorScheme,
+    now
+  );
+}
+
+export async function getViewSettings(
+  db: Database.Database,
+  userId?: string | null
+): Promise<ViewSettings> {
+  const normalizedUserId = normalizeUserId(userId);
+  if (!normalizedUserId) {
+    return DEFAULT_SETTINGS;
+  }
+
+  const row = db
+    .prepare(
+      `
+        SELECT columns_count, is_censored, color_scheme
+        FROM user_view_settings
+        WHERE user_id = ?
+        LIMIT 1
+      `
+    )
+    .get(normalizedUserId) as ViewSettingsRow | undefined;
+
+  if (row) return rowToViewSettings(row);
+
+  const initial = DEFAULT_SETTINGS;
+  upsertViewSettingsRow(db, normalizedUserId, initial);
+  return initial;
+}
+
+export async function updateViewSettings(
+  db: Database.Database,
+  newSettings: ViewSettings,
+  userId?: string | null
+): Promise<ViewSettings> {
   if (
     typeof newSettings !== "object" ||
     newSettings === null ||
-    typeof normalized.columnsCount !== "number" ||
-    !isValidColumnsCount(normalized.columnsCount) ||
-    typeof normalized.isCensored !== "boolean"
+    typeof newSettings.columnsCount !== "number" ||
+    !isValidColumnsCount(newSettings.columnsCount) ||
+    typeof newSettings.isCensored !== "boolean" ||
+    !isValidColorScheme(newSettings.colorScheme)
   ) {
     throw new AppError({
       status: 400,
@@ -107,15 +137,12 @@ export async function updateViewSettings(
     });
   }
 
-  // Убеждаемся, что папка data существует
-  await ensureDir(join(process.cwd(), "data"));
+  const normalized = normalizeViewSettings(newSettings);
+  const normalizedUserId = normalizeUserId(userId);
+  if (!normalizedUserId) {
+    return normalized;
+  }
 
-  // Сохраняем настройки
-  await writeFile(
-    VIEW_SETTINGS_FILE_PATH,
-    JSON.stringify(normalized, null, 2),
-    "utf-8"
-  );
-
+  upsertViewSettingsRow(db, normalizedUserId, normalized);
   return normalized;
 }

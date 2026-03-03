@@ -86,6 +86,7 @@ function initializeSchema(db: Database.Database): void {
       file_mtime INTEGER NOT NULL,
       file_birthtime INTEGER NOT NULL,
       file_size INTEGER NOT NULL,
+      remote_etag TEXT,
       FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
     );
     
@@ -135,32 +136,6 @@ function initializeSchema(db: Database.Database): void {
     CREATE UNIQUE INDEX IF NOT EXISTS ux_lorebooks_content_hash
     ON lorebooks(content_hash);
 
-    -- Pattern rules cache (regex scan results)
-    CREATE TABLE IF NOT EXISTS pattern_rules_cache (
-      rules_hash TEXT PRIMARY KEY,
-      created_at INTEGER NOT NULL,
-      status TEXT NOT NULL,
-      error TEXT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_pattern_rules_cache_status_created_at
-    ON pattern_rules_cache(status, created_at);
-
-    CREATE TABLE IF NOT EXISTS pattern_matches (
-      rules_hash TEXT NOT NULL,
-      card_id TEXT NOT NULL,
-      matched_rules TEXT NOT NULL,
-      updated_at INTEGER NOT NULL,
-      PRIMARY KEY (rules_hash, card_id),
-      FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_pattern_matches_rules_hash
-    ON pattern_matches(rules_hash);
-
-    CREATE INDEX IF NOT EXISTS idx_pattern_matches_card_id
-    ON pattern_matches(card_id);
-
     -- Auth/session and Nextcloud OAuth
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
@@ -209,6 +184,67 @@ function initializeSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_nextcloud_connections_user ON nextcloud_connections(user_id);
     CREATE INDEX IF NOT EXISTS idx_nextcloud_connections_identity
       ON nextcloud_connections(base_url, nextcloud_user_id);
+
+    -- User-scoped app settings and preferences
+    CREATE TABLE IF NOT EXISTS user_settings (
+      user_id TEXT PRIMARY KEY,
+      cards_folder_path TEXT,
+      sillytavenr_path TEXT,
+      language TEXT NOT NULL DEFAULT 'en',
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS user_view_settings (
+      user_id TEXT PRIMARY KEY,
+      columns_count INTEGER NOT NULL DEFAULT 5,
+      is_censored INTEGER NOT NULL DEFAULT 0,
+      color_scheme TEXT NOT NULL DEFAULT 'auto',
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS user_cards_filters_state (
+      user_id TEXT PRIMARY KEY,
+      state_json TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS user_pattern_rules (
+      user_id TEXT PRIMARY KEY,
+      rules_json TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS user_pattern_rules_cache (
+      user_id TEXT NOT NULL,
+      rules_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      error TEXT NULL,
+      PRIMARY KEY (user_id, rules_hash),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS user_pattern_matches (
+      user_id TEXT NOT NULL,
+      rules_hash TEXT NOT NULL,
+      card_id TEXT NOT NULL,
+      matched_rules TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, rules_hash, card_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_user_pattern_rules_cache_status_created_at
+      ON user_pattern_rules_cache(user_id, status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_user_pattern_matches_user_rules_hash
+      ON user_pattern_matches(user_id, rules_hash);
+    CREATE INDEX IF NOT EXISTS idx_user_pattern_matches_card_id
+      ON user_pattern_matches(card_id);
   `);
 
   // Расширения схемы для поиска/фильтрации (безопасно для уже существующей БД)
@@ -578,11 +614,13 @@ function initializeSchema(db: Database.Database): void {
     "file_birthtime",
     "file_birthtime INTEGER NOT NULL DEFAULT 0"
   );
+  addColumnIfMissing("card_files", "remote_etag", "remote_etag TEXT");
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_card_files_folder_path ON card_files(folder_path);
     CREATE INDEX IF NOT EXISTS idx_card_files_st_profile_handle ON card_files(st_profile_handle);
     CREATE INDEX IF NOT EXISTS idx_card_files_st_avatar_file ON card_files(st_avatar_file);
     CREATE INDEX IF NOT EXISTS idx_card_files_st_chats_folder_path ON card_files(st_chats_folder_path);
+    CREATE INDEX IF NOT EXISTS idx_card_files_remote_etag ON card_files(remote_etag);
   `);
 
   // Связь карточек и тегов для точной фильтрации

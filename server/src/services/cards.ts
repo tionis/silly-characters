@@ -53,6 +53,7 @@ export type CardsTextSearchMode = "like" | "fts";
 export interface SearchCardsParams {
   library_id?: string;
   library_ids?: string[];
+  user_id?: string | null;
   is_sillytavern?: TriState;
   is_hidden?: TriState;
   fav?: TriState;
@@ -278,34 +279,57 @@ export class CardsService {
     // pattern matches filter (cached)
     const patterns = params.patterns ?? "any";
     if (patterns !== "any") {
-      const lastReady = this.dbService.queryOne<{ rules_hash: string }>(
-        `
-        SELECT rules_hash
-        FROM pattern_rules_cache
-        WHERE status = 'ready'
-        ORDER BY created_at DESC
-        LIMIT 1
-      `
-      );
-      const rulesHash =
-        typeof lastReady?.rules_hash === "string" &&
-        lastReady.rules_hash.trim().length > 0
-          ? lastReady.rules_hash.trim()
-          : null;
+      const patternUserId =
+        typeof params.user_id === "string" ? params.user_id.trim() : "";
 
-      if (!rulesHash) {
+      if (!patternUserId) {
         if (patterns === "1") return [];
-        // patterns === "0": if no cache exists yet, treat as "no matches known" and return all.
-      } else if (patterns === "1") {
-        where.push(
-          `EXISTS (SELECT 1 FROM pattern_matches pm WHERE pm.rules_hash = ? AND pm.card_id = c.id)`
+      } else {
+        const lastReady = this.dbService.queryOne<{ rules_hash: string }>(
+          `
+          SELECT rules_hash
+          FROM user_pattern_rules_cache
+          WHERE user_id = ?
+            AND status = 'ready'
+          ORDER BY created_at DESC
+          LIMIT 1
+        `,
+          [patternUserId]
         );
-        sqlParams.push(rulesHash);
-      } else if (patterns === "0") {
-        where.push(
-          `NOT EXISTS (SELECT 1 FROM pattern_matches pm WHERE pm.rules_hash = ? AND pm.card_id = c.id)`
-        );
-        sqlParams.push(rulesHash);
+        const rulesHash =
+          typeof lastReady?.rules_hash === "string" &&
+          lastReady.rules_hash.trim().length > 0
+            ? lastReady.rules_hash.trim()
+            : null;
+
+        if (!rulesHash) {
+          if (patterns === "1") return [];
+          // patterns === "0": if no cache exists yet, treat as "no matches known" and return all.
+        } else if (patterns === "1") {
+          where.push(
+            `EXISTS (
+              SELECT 1
+              FROM user_pattern_matches pm
+              WHERE pm.user_id = ?
+                AND pm.rules_hash = ?
+                AND pm.card_id = c.id
+            )`
+          );
+          sqlParams.push(patternUserId);
+          sqlParams.push(rulesHash);
+        } else if (patterns === "0") {
+          where.push(
+            `NOT EXISTS (
+              SELECT 1
+              FROM user_pattern_matches pm
+              WHERE pm.user_id = ?
+                AND pm.rules_hash = ?
+                AND pm.card_id = c.id
+            )`
+          );
+          sqlParams.push(patternUserId);
+          sqlParams.push(rulesHash);
+        }
       }
     }
 

@@ -123,7 +123,7 @@ async function resolveTargetLibraryIds(
     throw new AppError({ status: 400, code: "api.tags.bulk_edit.no_targets_selected" });
   }
 
-  const settings = await getSettingsForUser(opts.userId);
+  const settings = await getSettingsForUser(opts.userId, db);
   const libraryIds: string[] = [];
 
   if (opts.applyToLibrary) {
@@ -533,4 +533,3 @@ export async function startTagsBulkEditRun(opts: {
 
   return { job };
 }
-
