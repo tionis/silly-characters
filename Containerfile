@@ -11,8 +11,8 @@ WORKDIR /app
 COPY server/package.json server/package-lock.json ./server/
 COPY client/package.json client/package-lock.json ./client/
 
-RUN npm ci --prefix server
-RUN npm ci --prefix client
+RUN npm install --prefix server --no-audit --no-fund
+RUN npm ci --prefix client --no-audit --no-fund --legacy-peer-deps
 
 COPY . .
 
