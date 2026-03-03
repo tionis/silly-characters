@@ -1,16 +1,11 @@
-# Plugins Folder
+# Plugins
 
-Plugins define behavior that is common to all the routes in your
-application. Authentication, caching, templates, and all the other cross
-cutting concerns should be handled by plugins placed in this folder.
+This folder contains shared server infrastructure modules.
 
-Files in this folder are typically defined through the
-[`fastify-plugin`](https://github.com/fastify/fastify-plugin) module,
-making them non-encapsulated. They can define decorators and set hooks
-that will then be used in the rest of your application.
+Current plugins include:
 
-Check out:
+- database initialization/migrations
+- scanner/bootstrap helpers (legacy/local mode)
 
-* [The hitchhiker's guide to plugins](https://fastify.dev/docs/latest/Guides/Plugins-Guide/)
-* [Fastify decorators](https://fastify.dev/docs/latest/Reference/Decorators/).
-* [Fastify lifecycle](https://fastify.dev/docs/latest/Reference/Lifecycle/).
+These modules are initialized by the Express app/server bootstrap and expose
+cross-cutting services through `app.locals`.

@@ -1,6 +1,30 @@
-# Characters Server
+# SillyCharacters Server
 
-Backend API for the Characters app.
+Express + TypeScript backend for SillyCharacters.
+
+## Responsibilities
+
+- Nextcloud OAuth login/session handling
+- Per-user Nextcloud connection management
+- Indexing character PNG metadata into SQLite cache
+- Card CRUD APIs backed by direct Nextcloud file operations
+- User-scoped preferences/filter state and background jobs
+
+## Runtime
+
+Build:
+
+```bash
+npm run build
+```
+
+Start:
+
+```bash
+npm run start
+```
+
+The server expects the client build output at `../client/dist`.
 
 ## Attribution
 
