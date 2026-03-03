@@ -1,0 +1,605 @@
+import Database from "better-sqlite3";
+import { createDatabaseService, DatabaseService } from "./database";
+import { AppError } from "../errors/app-error";
+
+export interface CardListItem {
+  id: string;
+  name: string | null;
+  tags: string[] | null;
+  creator: string | null;
+  fav: boolean;
+  avatar_url: string;
+  file_path: string | null;
+  spec_version: string | null;
+  created_at: number;
+  is_sillytavern: boolean;
+  alternate_greetings_count: number;
+  has_character_book: boolean;
+  prompt_tokens_est: number;
+  innkeeperMeta?: { isHidden: boolean };
+}
+
+export type TriState = "any" | "1" | "0";
+
+export type CardsSort =
+  | "created_at_desc"
+  | "created_at_asc"
+  | "name_asc"
+  | "name_desc"
+  | "prompt_tokens_desc"
+  | "prompt_tokens_asc"
+  | "st_chats_count_desc"
+  | "st_chats_count_asc"
+  | "st_last_chat_at_desc"
+  | "st_last_chat_at_asc"
+  | "st_first_chat_at_desc"
+  | "st_first_chat_at_asc"
+  | "relevance";
+
+export type CardsFtsField =
+  | "description"
+  | "personality"
+  | "scenario"
+  | "first_mes"
+  | "mes_example"
+  | "creator_notes"
+  | "system_prompt"
+  | "post_history_instructions"
+  | "alternate_greetings"
+  | "group_only_greetings";
+
+export type CardsTextSearchMode = "like" | "fts";
+
+export interface SearchCardsParams {
+  library_id?: string;
+  library_ids?: string[];
+  is_sillytavern?: TriState;
+  is_hidden?: TriState;
+  fav?: TriState;
+  sort?: CardsSort;
+  name?: string;
+  q?: string;
+  q_mode?: CardsTextSearchMode;
+  q_fields?: CardsFtsField[];
+  creators?: string[];
+  spec_versions?: string[];
+  tags?: string[]; // rawName (normalized)
+  created_from_ms?: number;
+  created_to_ms?: number;
+  has_creator_notes?: TriState;
+  has_system_prompt?: TriState;
+  has_post_history_instructions?: TriState;
+  has_personality?: TriState;
+  has_scenario?: TriState;
+  has_mes_example?: TriState;
+  has_character_book?: TriState;
+  has_alternate_greetings?: TriState;
+  alternate_greetings_min?: number;
+  prompt_tokens_min?: number;
+  prompt_tokens_max?: number;
+  patterns?: TriState;
+
+  // SillyTavern chats filters (computed from card_files)
+  // chats_count = number of *.jsonl files per character folder; aggregated per card via SUM over card_files
+  st_chats_count?: number;
+  st_chats_count_op?: "eq" | "gte" | "lte";
+  // Filter by SillyTavern profile (stored in card_files.st_profile_handle)
+  st_profile_handle?: string[];
+  // Filter: only cards that have at least one ST chat (aggregated across all profiles)
+  st_has_chats?: boolean;
+}
+
+/**
+ * Сервис для работы с карточками
+ */
+export class CardsService {
+  constructor(private dbService: DatabaseService) {}
+
+  /**
+   * Получает список всех карточек (без data_json для производительности)
+   * @returns Массив карточек с основными полями
+   */
+  getCardsList(): CardListItem[] {
+    return this.searchCards({ sort: "created_at_desc" });
+  }
+
+  /**
+   * Поиск/фильтрация карточек (v1, без пагинации)
+   */
+  searchCards(params: SearchCardsParams = {}): CardListItem[] {
+    const where: string[] = [];
+    const sqlParams: unknown[] = [];
+
+    const qRaw = typeof params.q === "string" ? params.q.trim() : "";
+    const hasQ = qRaw.length > 0;
+    const qMode: CardsTextSearchMode = params.q_mode === "fts" ? "fts" : "like";
+
+    const sort = params.sort ?? "created_at_desc";
+    const effectiveSort: Exclude<CardsSort, "relevance"> | "relevance" =
+      sort === "relevance" && (!hasQ || qMode !== "fts")
+        ? "created_at_desc"
+        : sort;
+
+    const needsStAgg =
+      effectiveSort === "st_chats_count_desc" ||
+      effectiveSort === "st_chats_count_asc" ||
+      effectiveSort === "st_last_chat_at_desc" ||
+      effectiveSort === "st_last_chat_at_asc" ||
+      effectiveSort === "st_first_chat_at_desc" ||
+      effectiveSort === "st_first_chat_at_asc" ||
+      params.st_has_chats === true ||
+      (typeof params.st_chats_count === "number" &&
+        Number.isFinite(params.st_chats_count) &&
+        params.st_chats_count >= 0);
+
+    const libraryIds =
+      Array.isArray(params.library_ids) && params.library_ids.length > 0
+        ? params.library_ids
+            .map((s) => String(s).trim())
+            .filter((s) => s.length > 0)
+        : [];
+
+    if (libraryIds.length > 0) {
+      const placeholders = libraryIds.map(() => "?").join(", ");
+      where.push(`c.library_id IN (${placeholders})`);
+      sqlParams.push(...libraryIds);
+    } else if (params.library_id && params.library_id.trim().length > 0) {
+      where.push(`c.library_id = ?`);
+      sqlParams.push(params.library_id.trim());
+    }
+
+    if (params.name && params.name.trim().length > 0) {
+      where.push(`c.name LIKE ? COLLATE NOCASE`);
+      sqlParams.push(`%${params.name.trim()}%`);
+    }
+
+    if (params.creators && params.creators.length > 0) {
+      const placeholders = params.creators.map(() => "?").join(", ");
+      where.push(`c.creator IN (${placeholders})`);
+      sqlParams.push(...params.creators);
+    }
+
+    if (params.spec_versions && params.spec_versions.length > 0) {
+      const placeholders = params.spec_versions.map(() => "?").join(", ");
+      where.push(`c.spec_version IN (${placeholders})`);
+      sqlParams.push(...params.spec_versions);
+    }
+
+    if (params.tags && params.tags.length > 0) {
+      for (const tagRawName of params.tags) {
+        where.push(
+          `EXISTS (SELECT 1 FROM card_tags ct WHERE ct.card_id = c.id AND ct.tag_rawName = ?)`
+        );
+        sqlParams.push(tagRawName);
+      }
+    }
+
+    if (
+      typeof params.created_from_ms === "number" &&
+      Number.isFinite(params.created_from_ms)
+    ) {
+      where.push(`c.created_at >= ?`);
+      sqlParams.push(params.created_from_ms);
+    }
+
+    if (
+      typeof params.created_to_ms === "number" &&
+      Number.isFinite(params.created_to_ms)
+    ) {
+      where.push(`c.created_at <= ?`);
+      sqlParams.push(params.created_to_ms);
+    }
+
+    const addTriState = (column: string, value: TriState | undefined) => {
+      if (!value || value === "any") return;
+      where.push(`${column} = ?`);
+      sqlParams.push(value === "1" ? 1 : 0);
+    };
+
+    addTriState("c.is_sillytavern", params.is_sillytavern);
+    // Default behavior should hide hidden cards; caller can pass "any" / "1".
+    addTriState("c.is_hidden", params.is_hidden);
+    addTriState("c.is_fav", params.fav);
+    addTriState("c.has_creator_notes", params.has_creator_notes);
+    addTriState("c.has_system_prompt", params.has_system_prompt);
+    addTriState(
+      "c.has_post_history_instructions",
+      params.has_post_history_instructions
+    );
+    addTriState("c.has_personality", params.has_personality);
+    addTriState("c.has_scenario", params.has_scenario);
+    addTriState("c.has_mes_example", params.has_mes_example);
+    addTriState("c.has_character_book", params.has_character_book);
+
+    if (
+      params.has_alternate_greetings &&
+      params.has_alternate_greetings !== "any"
+    ) {
+      if (params.has_alternate_greetings === "1") {
+        where.push(`c.alternate_greetings_count >= 1`);
+      } else {
+        where.push(`c.alternate_greetings_count = 0`);
+      }
+    }
+
+    if (
+      typeof params.alternate_greetings_min === "number" &&
+      Number.isFinite(params.alternate_greetings_min) &&
+      params.alternate_greetings_min > 0
+    ) {
+      where.push(`c.alternate_greetings_count >= ?`);
+      sqlParams.push(params.alternate_greetings_min);
+    }
+
+    // prompt_tokens_est range (0 => ignore)
+    const tokensMinRaw = params.prompt_tokens_min;
+    const tokensMaxRaw = params.prompt_tokens_max;
+    const tokensMin =
+      typeof tokensMinRaw === "number" && Number.isFinite(tokensMinRaw)
+        ? Math.max(0, Math.floor(tokensMinRaw))
+        : 0;
+    let tokensMax =
+      typeof tokensMaxRaw === "number" && Number.isFinite(tokensMaxRaw)
+        ? Math.max(0, Math.floor(tokensMaxRaw))
+        : 0;
+
+    if (tokensMin > 0 && tokensMax > 0 && tokensMax < tokensMin) {
+      tokensMax = tokensMin;
+    }
+
+    if (tokensMin > 0) {
+      where.push(`c.prompt_tokens_est >= ?`);
+      sqlParams.push(tokensMin);
+    }
+    if (tokensMax > 0) {
+      where.push(`c.prompt_tokens_est <= ?`);
+      sqlParams.push(tokensMax);
+    }
+
+    // ST profile filter: profile-specific meta stored in card_files
+    const stProfiles = Array.isArray(params.st_profile_handle)
+      ? params.st_profile_handle
+          .map((s) => String(s).trim())
+          .filter((s) => s.length > 0)
+      : [];
+    if (stProfiles.length > 0) {
+      const placeholders = stProfiles.map(() => "?").join(", ");
+      where.push(
+        `EXISTS (
+          SELECT 1
+          FROM card_files cf
+          WHERE cf.card_id = c.id
+            AND cf.st_profile_handle IN (${placeholders})
+        )`
+      );
+      sqlParams.push(...stProfiles);
+    }
+
+    // pattern matches filter (cached)
+    const patterns = params.patterns ?? "any";
+    if (patterns !== "any") {
+      const lastReady = this.dbService.queryOne<{ rules_hash: string }>(
+        `
+        SELECT rules_hash
+        FROM pattern_rules_cache
+        WHERE status = 'ready'
+        ORDER BY created_at DESC
+        LIMIT 1
+      `
+      );
+      const rulesHash =
+        typeof lastReady?.rules_hash === "string" &&
+        lastReady.rules_hash.trim().length > 0
+          ? lastReady.rules_hash.trim()
+          : null;
+
+      if (!rulesHash) {
+        if (patterns === "1") return [];
+        // patterns === "0": if no cache exists yet, treat as "no matches known" and return all.
+      } else if (patterns === "1") {
+        where.push(
+          `EXISTS (SELECT 1 FROM pattern_matches pm WHERE pm.rules_hash = ? AND pm.card_id = c.id)`
+        );
+        sqlParams.push(rulesHash);
+      } else if (patterns === "0") {
+        where.push(
+          `NOT EXISTS (SELECT 1 FROM pattern_matches pm WHERE pm.rules_hash = ? AND pm.card_id = c.id)`
+        );
+        sqlParams.push(rulesHash);
+      }
+    }
+
+    const joinSql = (() => {
+      if (!hasQ || qMode !== "fts") return "";
+      const exists = this.dbService.queryOne<{ ok: number }>(
+        `SELECT 1 as ok FROM sqlite_master WHERE type='table' AND name='cards_fts' LIMIT 1`
+      );
+      if (!exists?.ok) {
+        throw new AppError({ status: 500, code: "api.db.fts5_not_available" });
+      }
+      return `JOIN cards_fts ON cards_fts.rowid = c.rowid`;
+    })();
+
+    if (hasQ) {
+      const requestedFields = Array.isArray(params.q_fields)
+        ? (params.q_fields as CardsFtsField[]).filter(
+            (f) => typeof f === "string"
+          )
+        : [];
+
+      const fieldToColumn = (f: CardsFtsField): string => {
+        if (f === "alternate_greetings") return "alternate_greetings_text";
+        if (f === "group_only_greetings") return "group_only_greetings_text";
+        return f;
+      };
+
+      if (qMode === "fts") {
+        const maxLen = 200;
+        if (qRaw.length > maxLen) {
+          throw new AppError({
+            status: 400,
+            code: "api.cards.invalid_search_query",
+          });
+        }
+
+        const extractSearchTokens = (input: string): string[] => {
+          return input
+            .trim()
+            .split(/[^\p{L}\p{N}]+/gu)
+            .map((t) => t.trim())
+            .filter((t) => t.length > 0);
+        };
+
+        const tokens = extractSearchTokens(qRaw).slice(0, 12);
+
+        if (tokens.length === 0) {
+          throw new AppError({
+            status: 400,
+            code: "api.cards.invalid_search_query",
+          });
+        }
+
+        // Quote each token to avoid treating keywords like OR/NOT as operators
+        // and reduce "fts syntax error" surface.
+        const terms = tokens.map((t) => `"${t}*"`).join(" ");
+
+        const matchQuery = (() => {
+          if (!requestedFields || requestedFields.length === 0) {
+            return terms;
+          }
+          const cols = requestedFields.map((f) => fieldToColumn(f));
+          return cols.map((c) => `${c}:(${terms})`).join(" OR ");
+        })();
+
+        where.push(`cards_fts MATCH ?`);
+        sqlParams.push(matchQuery);
+      } else {
+        // LIKE mode: literal substring search across selected columns
+        const maxLen = 1000;
+        if (qRaw.length > maxLen) {
+          throw new AppError({
+            status: 400,
+            code: "api.cards.invalid_search_query",
+          });
+        }
+
+        const escapeLike = (input: string): string => {
+          // Escape order matters: backslash first.
+          return input
+            .replace(/\\/g, "\\\\")
+            .replace(/%/g, "\\%")
+            .replace(/_/g, "\\_");
+        };
+
+        const allColumns: string[] = [
+          "description",
+          "personality",
+          "scenario",
+          "first_mes",
+          "mes_example",
+          "creator_notes",
+          "system_prompt",
+          "post_history_instructions",
+          "alternate_greetings_text",
+          "group_only_greetings_text",
+        ];
+
+        const cols = (() => {
+          if (!requestedFields || requestedFields.length === 0)
+            return allColumns;
+          const mapped = requestedFields.map((f) => fieldToColumn(f));
+          // Keep unique and stable order.
+          const seen = new Set<string>();
+          const out: string[] = [];
+          for (const c of mapped) {
+            if (seen.has(c)) continue;
+            seen.add(c);
+            out.push(c);
+          }
+          return out.length > 0 ? out : allColumns;
+        })();
+
+        const pattern = `%${escapeLike(qRaw)}%`;
+        const orSql = cols
+          .map((c) => `c.${c} LIKE ? ESCAPE '\\' COLLATE NOCASE`)
+          .join(" OR ");
+        where.push(`(${orSql})`);
+        for (let i = 0; i < cols.length; i++) sqlParams.push(pattern);
+      }
+    }
+
+    const stAggJoin = needsStAgg
+      ? `
+        LEFT JOIN (
+          SELECT
+            cf.card_id as card_id,
+            SUM(COALESCE(cf.st_chats_count, 0)) as st_chats_count_sum,
+            MAX(COALESCE(cf.st_last_chat_at, 0)) as st_last_chat_at_max,
+            MIN(NULLIF(cf.st_first_chat_at, 0)) as st_first_chat_at_min
+          FROM card_files cf
+          GROUP BY cf.card_id
+        ) stagg ON stagg.card_id = c.id
+      `
+      : "";
+
+    // ST chats count filter: applies to SUM(st_chats_count) aggregated per card.
+    if (
+      typeof params.st_chats_count === "number" &&
+      Number.isFinite(params.st_chats_count) &&
+      params.st_chats_count >= 0
+    ) {
+      const op = params.st_chats_count_op ?? "gte";
+      if (op === "eq") {
+        where.push(`COALESCE(stagg.st_chats_count_sum, 0) = ?`);
+      } else if (op === "lte") {
+        where.push(`COALESCE(stagg.st_chats_count_sum, 0) <= ?`);
+      } else {
+        where.push(`COALESCE(stagg.st_chats_count_sum, 0) >= ?`);
+      }
+      sqlParams.push(Math.floor(params.st_chats_count));
+    }
+
+    if (params.st_has_chats === true) {
+      where.push(`COALESCE(stagg.st_chats_count_sum, 0) > 0`);
+    }
+
+    const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+    const orderBy = (() => {
+      if (
+        qMode === "fts" &&
+        hasQ &&
+        (effectiveSort === "relevance" || params.sort == null)
+      ) {
+        return `ORDER BY bm25(cards_fts) ASC`;
+      }
+
+      switch (effectiveSort) {
+        case "created_at_asc":
+          return `ORDER BY c.created_at ASC`;
+        case "name_asc":
+          return `ORDER BY c.name COLLATE NOCASE ASC, c.created_at DESC`;
+        case "name_desc":
+          return `ORDER BY c.name COLLATE NOCASE DESC, c.created_at DESC`;
+        case "prompt_tokens_asc":
+          return `ORDER BY c.prompt_tokens_est ASC, c.created_at DESC`;
+        case "prompt_tokens_desc":
+          return `ORDER BY c.prompt_tokens_est DESC, c.created_at DESC`;
+        case "st_chats_count_asc":
+          return `ORDER BY COALESCE(stagg.st_chats_count_sum, 0) ASC, c.created_at DESC`;
+        case "st_chats_count_desc":
+          return `ORDER BY COALESCE(stagg.st_chats_count_sum, 0) DESC, c.created_at DESC`;
+        case "st_last_chat_at_asc":
+          return `ORDER BY COALESCE(stagg.st_last_chat_at_max, 0) ASC, c.created_at DESC`;
+        case "st_last_chat_at_desc":
+          return `ORDER BY COALESCE(stagg.st_last_chat_at_max, 0) DESC, c.created_at DESC`;
+        case "st_first_chat_at_asc":
+          return `ORDER BY COALESCE(stagg.st_first_chat_at_min, 0) ASC, c.created_at DESC`;
+        case "st_first_chat_at_desc":
+          return `ORDER BY COALESCE(stagg.st_first_chat_at_min, 0) DESC, c.created_at DESC`;
+        case "created_at_desc":
+        default:
+          return `ORDER BY c.created_at DESC`;
+      }
+    })();
+
+    // SQL запрос выбирает только легкие колонки, без data_json
+    // Подзапрос для получения первого file_path из card_files
+    const sql = `
+      SELECT 
+        c.id,
+        c.name,
+        c.tags,
+        c.creator,
+        c.spec_version,
+        c.created_at,
+        c.is_sillytavern,
+        c.is_hidden,
+        c.is_fav,
+        c.alternate_greetings_count,
+        c.has_character_book,
+        c.prompt_tokens_est,
+        c.avatar_path,
+        (
+          SELECT COALESCE(
+            c.primary_file_path,
+            (
+              SELECT cf.file_path
+              FROM card_files cf
+              WHERE cf.card_id = c.id
+              ORDER BY cf.file_birthtime ASC, cf.file_path ASC
+              LIMIT 1
+            )
+          )
+        ) as file_path
+      FROM cards c
+      ${joinSql}
+      ${stAggJoin}
+      ${whereSql}
+      ${orderBy}
+    `;
+
+    const rows = this.dbService.query<{
+      id: string;
+      name: string | null;
+      tags: string | null;
+      creator: string | null;
+      spec_version: string | null;
+      created_at: number;
+      is_sillytavern: number;
+      is_hidden: number;
+      is_fav: number;
+      alternate_greetings_count: number;
+      has_character_book: number;
+      prompt_tokens_est: number;
+      avatar_path: string | null;
+      file_path: string | null;
+    }>(sql, sqlParams);
+
+    return rows.map((row) => {
+      let tags: string[] | null = null;
+      if (row.tags) {
+        try {
+          tags = JSON.parse(row.tags) as string[];
+        } catch {
+          tags = null;
+        }
+      }
+
+      const avatarUrl = row.avatar_path
+        ? `/api/thumbnail/${row.id}`
+        : "/api/thumbnail/default";
+
+      return {
+        id: row.id,
+        name: row.name,
+        tags,
+        creator: row.creator,
+        fav: row.is_fav === 1,
+        avatar_url: avatarUrl,
+        file_path: row.file_path,
+        spec_version: row.spec_version,
+        created_at: row.created_at,
+        is_sillytavern: row.is_sillytavern === 1,
+        innkeeperMeta: { isHidden: row.is_hidden === 1 },
+        alternate_greetings_count: Number.isFinite(
+          row.alternate_greetings_count
+        )
+          ? row.alternate_greetings_count
+          : 0,
+        has_character_book: row.has_character_book === 1,
+        prompt_tokens_est: Number.isFinite(row.prompt_tokens_est)
+          ? row.prompt_tokens_est
+          : 0,
+      };
+    });
+  }
+}
+
+/**
+ * Создает экземпляр CardsService из экземпляра Database
+ */
+export function createCardsService(db: Database.Database): CardsService {
+  const dbService = createDatabaseService(db);
+  return new CardsService(dbService);
+}

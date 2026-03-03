@@ -1,0 +1,27 @@
+{
+  "name": "@characters/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0",
+  "contributors": [
+    "Dmitry Plyaskin (upstream SillyInnkeeper project)"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "echo \"No lint configured for @characters/shared\"",
+    "format": "echo \"No formatter configured for @characters/shared\""
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

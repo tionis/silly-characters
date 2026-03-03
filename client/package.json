@@ -1,0 +1,50 @@
+{
+  "name": "@characters/client",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Characters web client (derived from SillyInnkeeper)",
+  "type": "module",
+  "license": "AGPL-3.0",
+  "author": "Eric",
+  "contributors": [
+    "Dmitry Plyaskin (upstream SillyInnkeeper project)"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mantine/core": "8.3.10",
+    "@mantine/form": "^8.3.10",
+    "@mantine/hooks": "8.3.10",
+    "@mantine/notifications": "^8.3.10",
+    "@tabler/icons-react": "^3.36.0",
+    "dompurify": "^3.3.1",
+    "effector": "^23.4.4",
+    "effector-react": "^23.3.0",
+    "i18next": "^25.7.2",
+    "patronum": "^2.3.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "react-i18next": "^16.5.0",
+    "react-markdown": "^10.1.0",
+    "react-virtuoso": "^4.17.0",
+    "rehype-raw": "^7.0.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.8",
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.2",
+    "postcss": "^8.5.6",
+    "postcss-preset-mantine": "1.18.0",
+    "postcss-simple-vars": "^7.0.1",
+    "terser": "^5.43.1",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5"
+  },
+  "packageManager": "yarn@4.12.0"
+}

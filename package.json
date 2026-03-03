@@ -1,0 +1,25 @@
+{
+  "name": "characters",
+  "version": "0.2.0",
+  "description": "Multi-user web utility for SillyTavern character management with Nextcloud-backed storage",
+  "private": true,
+  "license": "AGPL-3.0",
+  "contributors": [
+    "Dmitry Plyaskin (upstream SillyInnkeeper project)"
+  ],
+  "packageManager": "bun@1.3.1",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "bun run --cwd server native:ensure && concurrently -n api,web -c cyan,magenta \"bun run --cwd server dev\" \"bun run --cwd client dev\"",
+    "dev:api": "bun run --cwd server native:ensure && bun run --cwd server dev",
+    "dev:web": "bun run --cwd client dev",
+    "build": "bun run --cwd server build && bun run --cwd client build",
+    "typecheck": "bun run --cwd server type-check && bun run --cwd client type-check"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

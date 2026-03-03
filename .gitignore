@@ -1,0 +1,31 @@
+node_modules/
+client/node_modules/
+server/node_modules/
+dist/
+data/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+*.log
+.env
+
+# Bun
+bun.lockb
+
+# Env
+.env
+.env.local
+server/.env
+client/.env
+
+# Editor
+.idea/
+.vscode/
+
+# Build outputs
+client/dist/
+server/dist/
+
+# Lockfiles not used in this Bun-first repo
+**/package-lock.json
