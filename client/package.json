@@ -44,7 +44,7 @@
     "postcss-simple-vars": "^7.0.1",
     "terser": "^5.43.1",
     "typescript": "^5.9.2",
-    "vite": "^7.1.5"
+    "vite": "^7.3.2"
   },
   "packageManager": "yarn@4.12.0"
 }
